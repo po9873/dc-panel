@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+data/
+*.tmp
+push*.py
+dc.ico
+chk*.js
