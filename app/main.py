@@ -60,6 +60,94 @@ def _add_history(record: dict):
     _save(HISTORY_FILE, h[:2000])
 
 
+AUTOMATION_STATE_FILE = DATA_DIR / "automation_state.json"
+AUTOMATION_DEFAULTS = {
+    "enabled": True,
+    "update_cron": "*/15 * * * *",
+    "update_notify": True,
+    "auto_update_cron": "",
+    "auto_update_notify": True,
+    "auto_update_success": True,
+    "schedule_report": False,
+    "delete_images": False,
+    "interval": 10,
+    "interval_limit": 6,
+}
+AUTOMATION_TASK = None
+AUTOMATION_LAST_RUN = {"update": "", "auto": ""}
+
+
+def _automation_config() -> dict:
+    cfg = _config().get("automation") or {}
+    out = dict(AUTOMATION_DEFAULTS)
+    out.update({k: v for k, v in cfg.items() if k in out})
+    out["interval"] = max(1, int(out.get("interval") or 10))
+    out["interval_limit"] = max(1, int(out.get("interval_limit") or 6))
+    return out
+
+
+def _automation_devices() -> dict:
+    raw = _config().get("automation_devices") or {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _cron_part(value: int, token: str, low: int, high: int) -> bool:
+    for piece in str(token or "*").split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        base, _, step_text = piece.partition("/")
+        try:
+            step = max(1, int(step_text)) if step_text else 1
+        except ValueError:
+            continue
+        if base == "*":
+            start, end = low, high
+        elif "-" in base:
+            try:
+                start, end = (int(x) for x in base.split("-", 1))
+            except ValueError:
+                continue
+        else:
+            try:
+                start = end = int(base)
+            except ValueError:
+                continue
+        if start <= value <= end and (value - start) % step == 0:
+            return True
+    return False
+
+
+def _cron_matches(expr: str, now: datetime) -> bool:
+    fields = str(expr or "").split()
+    if len(fields) != 5:
+        return False
+    minute, hour, dom, month, dow = fields
+    cron_dow = (now.weekday() + 1) % 7
+    if cron_dow == 0:
+        dow_values = (0, 7)
+    else:
+        dow_values = (cron_dow,)
+    minute_ok = _cron_part(now.minute, minute, 0, 59)
+    hour_ok = _cron_part(now.hour, hour, 0, 23)
+    month_ok = _cron_part(now.month, month, 1, 12)
+    dom_any = str(dom).strip() == "*"
+    dow_any = str(dow).strip() in ("*", "?", "")
+    dom_ok = _cron_part(now.day, dom, 1, 31)
+    dow_ok = any(_cron_part(v, dow, 0, 7) for v in dow_values)
+    # 标准 cron：当日/月和星期字段都有限制时，两者采用 OR。
+    day_ok = (dom_ok and dow_ok) if (dom_any or dow_any) else (dom_ok or dow_ok)
+    return minute_ok and hour_ok and month_ok and day_ok
+
+
+def _save_automation_state(state: dict):
+    _save(AUTOMATION_STATE_FILE, state)
+
+
+def _record_time() -> str:
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _hash_password(pwd: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", pwd.encode(), salt.encode(), 100_000).hex()
 
@@ -89,8 +177,9 @@ def dc_jwt(secret_key: str) -> str:
 
 
 def dc_headers(secret_key: str) -> dict:
-    return {"Authorization": f"Bearer {dc_jwt(secret_key)}",
-            "Content-Type": "application/json"}
+    # 不要在公共请求头中强制声明 JSON：DockerCopilot 的更新接口接收
+    # application/x-www-form-urlencoded，而其他 json= 请求会由 httpx 自动设置类型。
+    return {"Authorization": f"Bearer {dc_jwt(secret_key)}"}
 
 
 async def dc_request(client: httpx.AsyncClient, device: dict, method: str, path: str, **kw):
@@ -110,6 +199,51 @@ async def dc_get(client, device, path):
         raise
     except Exception as e:
         raise HTTPException(502, f"DC [{device['name']}] 请求失败：{e}")
+
+
+def _container_array(data) -> list:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("data") or data.get("containers") or []
+    return []
+
+
+def _image_name(container: dict) -> str:
+    return str(container.get("usingImage") or container.get("createImage")
+               or container.get("image") or "").strip()
+
+
+def _is_true(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "none", "null")
+    return bool(value)
+
+
+async def dc_update(client, device: dict, container: dict):
+    """按 DockerCopilot 的实际接口提交更新请求。"""
+    name = str(container.get("name") or container.get("id") or "").strip()
+    cid = str(container.get("id") or name).strip()
+    image = _image_name(container)
+    if not name or not image:
+        raise HTTPException(400, f"DC [{device['name']}] 缺少容器名或镜像名")
+    r = await dc_request(
+        client, device, "POST", f"/api/container/{urllib.parse.quote(cid, safe='')}/update",
+        # DockerCopilot 当前更新接口按表单字段解析；发送 JSON 会返回
+        # `field "imageNameAndTag" is not set`，即使字段名看起来存在。
+        data={"containerName": name, "imageNameAndTag": image},
+    )
+    payload = r.json() if r.content else {}
+    if isinstance(payload, dict):
+        code = payload.get("code")
+        if code not in (None, 0, 200):
+            raise HTTPException(502, f"DC [{device['name']}] 更新失败：{payload.get('msg') or payload.get('message') or code}")
+        if payload.get("success") is False:
+            raise HTTPException(502, f"DC [{device['name']}] 更新失败：{payload.get('msg') or payload.get('message') or '接口返回失败'}")
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        task_id = payload.get("taskID") or payload.get("taskId") or data.get("taskID") or data.get("taskId") or ""
+        return payload, str(task_id or "")
+    raise HTTPException(502, f"DC [{device['name']}] 更新接口返回格式错误")
 
 
 # ---------- 鉴权 ----------
@@ -176,6 +310,21 @@ async def startup():
         return
     _save_config(cfg)
     serializer = URLSafeTimedSerializer(cfg["salt"] + "-session")
+    global AUTOMATION_TASK
+    if AUTOMATION_TASK is None or AUTOMATION_TASK.done():
+        AUTOMATION_TASK = asyncio.create_task(_automation_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global AUTOMATION_TASK
+    if AUTOMATION_TASK and not AUTOMATION_TASK.done():
+        AUTOMATION_TASK.cancel()
+        try:
+            await AUTOMATION_TASK
+        except asyncio.CancelledError:
+            pass
+        AUTOMATION_TASK = None
 
 
 # ---------- 页面 ----------
@@ -537,33 +686,192 @@ async def list_containers(device_id: str, request: Request):
     return containers
 
 
+# ---------- 自动更新检查（按 V1 插件逻辑） ----------
+
+async def _automation_loop():
+    """独立于浏览器的周期扫描：发现 DC 返回 haveUpdate=true 就记录并通知。"""
+    global AUTOMATION_LAST_RUN
+    while True:
+        try:
+            cfg = _automation_config()
+            now = datetime.now(timezone(timedelta(hours=8)))
+            minute_key = now.strftime("%Y-%m-%d %H:%M")
+            if cfg.get("enabled") and _cron_matches(cfg.get("update_cron"), now):
+                if AUTOMATION_LAST_RUN.get("update") != minute_key:
+                    AUTOMATION_LAST_RUN["update"] = minute_key
+                    await _scan_updates(auto=False)
+            if cfg.get("enabled") and cfg.get("auto_update_cron") and _cron_matches(cfg.get("auto_update_cron"), now):
+                if AUTOMATION_LAST_RUN.get("auto") != minute_key:
+                    AUTOMATION_LAST_RUN["auto"] = minute_key
+                    await _scan_updates(auto=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[automation] 扫描失败: {e}", flush=True)
+        await asyncio.sleep(20)
+
+
+async def _scan_updates(auto: bool = False):
+    cfg = _automation_config()
+    if auto and not cfg.get("auto_update_cron"):
+        return
+    async with httpx.AsyncClient() as client:
+        for device in _devices():
+            try:
+                data = await dc_get(client, device, "/api/containers")
+                await _scan_device_updates(device, _container_array(data), client, cfg, auto)
+            except Exception as e:
+                print(f"[automation] {device.get('name')} 检查失败: {e}", flush=True)
+
+
+async def _scan_device_updates(device: dict, containers: list, client, cfg: dict, auto: bool):
+    state = _load(AUTOMATION_STATE_FILE, {})
+    pending = state.setdefault("pending", {})
+    selections = _automation_devices().get(device.get("id"), {})
+    selected_key = "auto_update" if auto else "update"
+    selected = selections.get(selected_key) or []
+    seen = set()
+    for c in containers:
+        name = str(c.get("name") or c.get("id") or "").strip()
+        if not name:
+            continue
+        key = f"{device.get('id')}::{name}"
+        seen.add(key)
+        has_update = _is_true(c.get("haveUpdate"))
+        if not has_update:
+            pending.pop(key, None)
+            continue
+        # 空选择表示该设备不启用这一类任务；有选择时只处理勾选项。
+        if not selected or name not in selected:
+            continue
+        image = _image_name(c)
+        fingerprint = image + "|" + str(c.get("latestImage") or c.get("updateImage") or c.get("tag") or "")
+        if auto:
+            entry = pending.get(key, {})
+            # 只有更新任务已成功提交才去重。旧版本在请求前就写指纹，失败后会
+            # 永久跳过同一镜像；没有 auto_status 的旧记录按失败状态重新尝试。
+            if (entry.get("auto_fingerprint") == fingerprint
+                    and entry.get("auto_status") == "submitted"):
+                continue
+            record = {
+                "id": secrets.token_hex(6), "time": _record_time(), "device": device["name"],
+                "container": name, "image": image, "status": "进行中", "source": "自动更新"
+            }
+            _add_history(record)
+            try:
+                payload, task_id = await dc_update(client, device, c)
+                pending.setdefault(key, {}).update({
+                    "auto_fingerprint": fingerprint,
+                    "auto_status": "submitted",
+                    "image": image,
+                    "time": _record_time(),
+                })
+                record["message"] = str(payload.get("msg") or payload.get("message") or "自动更新任务已创建")
+                record["taskID"] = task_id
+                _refresh_history(record)
+                if cfg.get("auto_update_notify"):
+                    await notify_update({**record, "status": "已触发"})
+                if task_id and (cfg.get("auto_update_success") or cfg.get("schedule_report")):
+                    asyncio.create_task(_poll_progress(device, task_id, record, cfg))
+            except Exception as e:
+                message = str(e)
+                failed_entry = pending.setdefault(key, {})
+                failed_entry.pop("auto_fingerprint", None)
+                failed_entry.update({
+                    "auto_status": "busy" if "已有任务在执行中" in message else "failed",
+                    "image": image,
+                    "time": _record_time(),
+                })
+                # DockerCopilot 已在处理同一资源时不算更新失败。保留可重试状态，
+                # 但不重复发送失败通知，避免 MP 插件与面板同时调度造成通知轰炸。
+                if "已有任务在执行中" in message:
+                    record["status"] = "等待中"
+                    record["message"] = "DockerCopilot 已有同资源任务，已延后到下次周期重试"
+                    _refresh_history(record)
+                else:
+                    record["status"] = "失败"; record["message"] = message; _refresh_history(record)
+                    if cfg.get("auto_update_notify") or cfg.get("auto_update_success"):
+                        await notify_update(record)
+        else:
+            if pending.get(key, {}).get("notify_fingerprint") == fingerprint:
+                continue
+            pending.setdefault(key, {})["notify_fingerprint"] = fingerprint
+            pending[key].update({"image": image, "time": _record_time()})
+            record = {
+                "id": secrets.token_hex(6), "time": _record_time(), "device": device["name"],
+                "container": name, "image": image, "status": "可更新", "source": "定时检查",
+                "message": "DockerCopilot 检测到新镜像"
+            }
+            _add_history(record)
+            if cfg.get("update_notify"):
+                await notify_update(record)
+    # 删除 DC 返回列表中已经消失的旧状态，避免容器重建后卡住去重状态。
+    for key in list(pending):
+        if key.startswith(f"{device.get('id')}::") and key not in seen:
+            pending.pop(key, None)
+    _save_automation_state(state)
+
+
 # ---------- 更新 ----------
 
-async def _poll_progress(device: dict, task_id: str, record: dict):
-    """后台轮询更新进度，写回历史记录"""
+async def _poll_progress(device: dict, task_id: str, record: dict, automation_cfg: dict = None):
+    """后台轮询更新进度，兼容 DC 的 code/msg 和 status/progress 两种返回格式。"""
+    cfg = automation_cfg or {}
+    final_notified = False
     try:
         async with httpx.AsyncClient() as client:
-            for _ in range(120):  # 最多 10 分钟
-                await asyncio.sleep(5)
+            for _ in range(max(1, int(cfg.get("interval_limit") or 6))):
+                await asyncio.sleep(max(1, int(cfg.get("interval") or 5)))
                 try:
-                    r = await dc_request(client, device, "GET", f"/api/progress/{task_id}")
-                    p = r.json()
+                    r = await dc_request(client, device, "GET", f"/api/progress/{urllib.parse.quote(str(task_id), safe='')}")
+                    p = r.json() if r.content else {}
                 except Exception:
                     continue
-                status = (p.get("status") or "").lower()
-                record["progress"] = p.get("progress", record.get("progress", ""))
-                if status in ("completed", "success", "done"):
+                if not isinstance(p, dict):
+                    continue
+                detail = p.get("data") if isinstance(p.get("data"), dict) else {}
+                msg = str(detail.get("message") or detail.get("detailMsg")
+                          or p.get("msg") or p.get("message") or p.get("detail") or "")
+                status = str(detail.get("status") or p.get("status") or "").lower()
+                code = p.get("code")
+                percentage = detail.get("percentage", p.get("percentage"))
+                detail_msg = str(detail.get("detailMsg") or detail.get("message") or msg)
+                if percentage is not None:
+                    record["progress"] = f"{percentage}% {detail_msg}".strip()
+                else:
+                    record["progress"] = str(p.get("progress") or detail_msg or record.get("progress") or "")
+                is_done = _is_true(detail.get("isDone", p.get("isDone")))
+                is_failed = _is_true(detail.get("failed", p.get("failed")))
+                is_canceled = _is_true(detail.get("canceled", p.get("canceled")))
+                success = (is_done and not is_failed and not is_canceled) \
+                    or status in ("completed", "complete", "success", "done") \
+                    or (code == 200 and any(x in msg.lower() for x in ("成功", "success", "完成", "completed")))
+                failed = is_failed or is_canceled \
+                    or status in ("failed", "failure", "error", "canceled", "cancelled") \
+                    or (code not in (None, 0, 200) and bool(msg)) \
+                    or any(x in msg.lower() for x in ("失败", "错误", "failed", "error", "取消", "canceled"))
+                if cfg.get("schedule_report") and not (success or failed):
+                    await notify_update({**record, "status": "进度", "message": msg})
+                if success:
                     record["status"] = "成功"
-                    await notify_update(record)
+                    record["message"] = detail_msg or msg or "容器更新成功"
+                    if cfg.get("auto_update_success", True):
+                        await notify_update(record)
+                        final_notified = True
                     break
-                if status in ("failed", "error"):
+                if failed:
                     record["status"] = "失败"
-                    record["message"] = p.get("message", "")
-                    await notify_update(record)
+                    record["message"] = detail_msg or msg or "DockerCopilot 返回更新失败"
+                    if cfg.get("auto_update_success", True):
+                        await notify_update(record)
+                        final_notified = True
                     break
                 _refresh_history(record)
         if record["status"] == "进行中":
             record["status"] = "已完成（未确认结果）"
+            record["message"] = "轮询结束，DockerCopilot 未返回明确终态"
+            if cfg.get("auto_update_success", True) and not final_notified:
+                await notify_update(record)
     finally:
         _refresh_history(record)
 
@@ -590,8 +898,7 @@ async def update_containers(device_id: str, request: Request):
     if not ids:
         raise HTTPException(400, "未选择容器")
     async with httpx.AsyncClient() as client:
-        containers = await dc_get(client, device, "/api/containers")
-        containers = containers if isinstance(containers, list) else containers.get("containers") or []
+        containers = _container_array(await dc_get(client, device, "/api/containers"))
         name_by_id = {c.get("id") or c.get("name"): c for c in containers}
         results = []
         for cid in ids:
@@ -607,17 +914,83 @@ async def update_containers(device_id: str, request: Request):
             }
             _add_history(record)
             try:
-                r = await dc_request(client, device, "POST", f"/api/container/{cid}/update")
-                task_id = r.json().get("taskID") or r.json().get("taskId") or ""
+                payload, task_id = await dc_update(client, device, c)
+                record["message"] = str(payload.get("msg") or payload.get("message") or "更新任务已创建")
+                record["taskID"] = task_id
+                _refresh_history(record)
                 results.append({"id": cid, "name": record["container"], "ok": True, "taskID": task_id, "recordId": record["id"]})
                 if task_id:
-                    asyncio.create_task(_poll_progress(device, task_id, record))
+                    asyncio.create_task(_poll_progress(device, task_id, record, _automation_config()))
             except Exception as e:
                 record["status"] = "失败"
                 record["message"] = str(e)
                 _refresh_history(record)
                 results.append({"id": cid, "name": record["container"], "ok": False, "error": str(e)})
     return results
+
+
+@app.get("/api/automation")
+async def get_automation(request: Request):
+    _check_login(request)
+    cfg = _automation_config()
+    devices = []
+    async with httpx.AsyncClient() as client:
+        for d in _devices():
+            item = {"id": d["id"], "name": d["name"], "containers": [], "selected": _automation_devices().get(d["id"], {})}
+            try:
+                data = await dc_get(client, d, "/api/containers")
+                arr = _container_array(data)
+                item["containers"] = [{"name": c.get("name") or c.get("id"), "haveUpdate": _is_true(c.get("haveUpdate"))} for c in arr]
+            except Exception:
+                pass
+            devices.append(item)
+    return {"config": cfg, "devices": devices}
+
+
+@app.put("/api/automation")
+async def set_automation(request: Request):
+    _check_login(request)
+    body = await request.json()
+    incoming = body.get("config") or {}
+    cfg = _automation_config()
+    cron_errors = []
+    for k in AUTOMATION_DEFAULTS:
+        if k in incoming:
+            cfg[k] = incoming[k]
+    cfg["enabled"] = bool(cfg.get("enabled"))
+    for key in ("update_notify", "auto_update_notify", "auto_update_success", "schedule_report", "delete_images"):
+        cfg[key] = bool(cfg.get(key))
+    cfg["interval"] = max(1, int(cfg.get("interval") or 10))
+    cfg["interval_limit"] = max(1, int(cfg.get("interval_limit") or 6))
+    for key in ("update_cron", "auto_update_cron"):
+        expr = str(cfg.get(key) or "").strip()
+        if expr:
+            fields = expr.split()
+            if len(fields) != 5 or not all(any(ch.isdigit() or ch == "*" for ch in part) for part in fields):
+                cron_errors.append(f"{key} 不是有效的 5 段 cron")
+    if cron_errors:
+        raise HTTPException(400, "；".join(cron_errors))
+    devices = {}
+    valid_devices = {str(d.get("id")): d for d in _devices()}
+    for did, selected in (body.get("devices") or {}).items():
+        if not isinstance(selected, dict) or str(did) not in valid_devices:
+            continue
+        devices[str(did)] = {
+            "update": [str(x) for x in (selected.get("update") or [])],
+            "auto_update": [str(x) for x in (selected.get("auto_update") or [])],
+        }
+    data = _config()
+    data["automation"] = cfg
+    data["automation_devices"] = devices
+    _save_config(data)
+    return {"ok": True, "config": cfg, "devices": devices}
+
+
+@app.post("/api/automation/run")
+async def run_automation(request: Request):
+    _check_login(request)
+    await _scan_updates(auto=False)
+    return {"ok": True, "message": "已立即检查所有设备"}
 
 
 @app.get("/api/history")
@@ -652,19 +1025,33 @@ async def stats(request: Request):
 @app.get("/api/export")
 async def export_config(request: Request):
     _check_login(request)
+    selections = _automation_devices()
     devices = [{
         "name": d["name"],
         "host": d["url"].split("://", 1)[-1],  # 去掉 http(s):// 前缀，与 MP 插件一致
         "secret_key": d["secretKey"],
-        "updatable": [],
-        "auto_update": [],
+        "updatable": list((selections.get(d["id"], {}) or {}).get("update") or []),
+        "auto_update": list((selections.get(d["id"], {}) or {}).get("auto_update") or []),
     } for d in _devices()]
+    automation = _automation_config()
     payload = {
         "schema": "dc-helper",
         "schema_version": 1,
         "exported_at": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S"),
         "source": "dc-panel",
+        "enabled": bool(automation.get("enabled")),
         "devices": devices,
+        "notify": {
+            "update_cron": automation.get("update_cron") or "",
+            "update_notify": bool(automation.get("update_notify")),
+            "auto_update_cron": automation.get("auto_update_cron") or "",
+            "auto_update_notify": bool(automation.get("auto_update_notify")),
+            "auto_update_success": bool(automation.get("auto_update_success")),
+            "schedule_report": bool(automation.get("schedule_report")),
+            "delete_images": bool(automation.get("delete_images")),
+            "interval": automation.get("interval", 10),
+            "interval_limit": automation.get("interval_limit", 6),
+        },
     }
     data = json.dumps(payload, ensure_ascii=False, indent=2)
     return Response(content=data, media_type="application/json",
@@ -692,7 +1079,19 @@ async def import_config(request: Request):
                 break
             items.append({"name": data.get(f"name{n}"), "host": h, "secret_key": data.get(f"secretKey{n}")})
     devices = _devices()
+    existing_automation = _automation_devices()
+    imported_automation = data.get("notify") if isinstance(data.get("notify"), dict) else {}
+    automation = _automation_config()
+    for source_key, target_key in (("update_cron", "update_cron"), ("update_notify", "update_notify"),
+                                   ("auto_update_cron", "auto_update_cron"), ("auto_update_notify", "auto_update_notify"),
+                                   ("auto_update_success", "auto_update_success"), ("schedule_report", "schedule_report"),
+                                   ("delete_images", "delete_images"), ("interval", "interval"), ("interval_limit", "interval_limit")):
+        if source_key in imported_automation:
+            automation[target_key] = imported_automation[source_key]
+    if "enabled" in data:
+        automation["enabled"] = bool(data.get("enabled"))
     added, skipped = 0, 0
+    imported_selections = []
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -702,15 +1101,28 @@ async def import_config(request: Request):
             continue
         url = host if host.startswith("http") else "http://" + host
         url = url.rstrip("/")
-        if any(d["url"].rstrip("/") == url for d in devices):
+        found = next((d for d in devices if d["url"].rstrip("/") == url), None)
+        if found:
             skipped += 1
-            continue
-        devices.append({"id": secrets.token_hex(4), "name": str(item.get("name") or "").strip() or f"DC{added+1}",
-                        "url": url, "secretKey": key})
-        added += 1
+            did = found["id"]
+        else:
+            did = secrets.token_hex(4)
+            devices.append({"id": did, "name": str(item.get("name") or "").strip() or f"DC{added+1}",
+                            "url": url, "secretKey": key})
+            added += 1
+        imported_selections.append((did, item))
     if not added and not skipped:
         raise HTTPException(400, "文件里没有有效设备（host / secret_key 为空）")
+    for did, item in imported_selections:
+        existing_automation[did] = {
+            "update": [str(x) for x in (item.get("updatable") or item.get("update") or [])],
+            "auto_update": [str(x) for x in (item.get("auto_update") or [])],
+        }
+    cfg = _config()
+    cfg["automation"] = automation
+    cfg["automation_devices"] = existing_automation
     _save_devices(devices)
+    _save_config(cfg)
     return {"ok": True, "added": added, "skipped": skipped}
 
 
