@@ -20,7 +20,6 @@ DATA_DIR = Path(os.environ.get("PANEL_DATA", "/data"))
 CONFIG_FILE = DATA_DIR / "panel.json"
 HISTORY_FILE = DATA_DIR / "history.json"
 PORT = int(os.environ.get("PANEL_PORT", "8000"))
-DC_IMAGE = "l429609201/dockercopilot"
 USERNAME = os.environ.get("PANEL_USERNAME", "admin").strip() or "admin"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -490,7 +489,7 @@ async def status(request: Request):
 
 # ---------- 面板自身更新检测（Docker Hub） ----------
 
-HUB_REPO = os.environ.get("PANEL_HUB_REPO", "po9873/dc-panel")
+HUB_REPO = os.environ.get("PANEL_HUB_REPO", "<dockerhub-user>/dc-panel")
 APP_VERSION = "v1.1.0"
 
 def _boot_time():

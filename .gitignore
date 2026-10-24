@@ -2,6 +2,14 @@ __pycache__/
 *.pyc
 data/
 *.tmp
+*.log
+*.bak
+*.jwt
+*_remote*
+*_live*
+.workbuddy/
+*.tar
+*.zip
 push*.py
 dc.ico
 chk*.js

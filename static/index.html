@@ -479,7 +479,7 @@ button.sm{font-size:13px;padding:4px 9px;border-radius:7px}
     <div id="devList"></div>
     <div class="row" style="margin:12px auto 0;max-width:var(--devW,100%)">
       <input id="nName" placeholder="名称（如：my-nas）" style="flex:1;min-width:110px">
-      <input id="nUrl" placeholder="地址（如 192.168.1.100:12712）" style="flex:2;min-width:160px">
+      <input id="nUrl" placeholder="地址（如 dc-host.example:12712）" style="flex:2;min-width:160px">
       <input id="nKey" placeholder="secretKey" style="flex:2;min-width:140px" type="password">
       <button onclick="addDev()">添加</button>
     </div>
@@ -716,7 +716,7 @@ async function checkPanelUpdate(){
 }
 function showUpdateTip(){
   const upd=$('verInfo')&&$('verInfo').querySelector('.upd-badge');
-  if(upd)alert('面板有新版本！\n\n在 38 上执行：\n  cd /data/compose/dc-panel\n  docker compose pull && docker compose up -d\n\n完成后刷新页面即可。');
+  if(upd)alert('面板有新版本！\n\n请在部署面板的主机上执行对应的 compose pull/up 命令，完成后刷新页面即可。');
 }
 function _curTheme(){
   const m=window.__themeMode||'dark';
@@ -954,7 +954,7 @@ async function loadAccount(){
 }
 const NT=[
  {id:'wecom',name:'企业微信机器人',icon:'💬',proxy:false,fields:[
-   ['webhook','Webhook 地址','https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxx']]},
+   ['webhook','Webhook 地址','https://example.invalid/webhook?key=your-key']]},
  {id:'dingtalk',name:'钉钉机器人',icon:'📌',proxy:false,fields:[
    ['webhook','Webhook 地址','https://oapi.dingtalk.com/robot/send?access_token=xxxx'],
    ['secret','加签密钥（未开加签留空）','SECxxxxxx']]},
@@ -1211,7 +1211,7 @@ function renderContainers(){
     const img=c.usingImage||c.createImage||c.image||'';
     const st=(c.status||c.state||'').toLowerCase();
     const running=st.includes('run')||st==='up';
-    const isDC=(img||'').split(':')[0]==='l429609201/dockercopilot';
+    const isDC=(img||'').toLowerCase().includes('dockercopilot');
     return `<tr><td><input type="checkbox" ${sel.has(id)?'checked':''} onchange="tog('${id}',this.checked)"></td>
     <td><b>${esc(nm)}</b>${isDC?' <span class="badge b-info">DC本体</span>':''}${c.haveUpdate?' <span class="badge b-warn">可更新</span>':''}</td>
     <td class="hide-m" style="color:var(--sub);font-size:14px">${esc(img)}</td>
@@ -1306,7 +1306,7 @@ function renderSide(){
       <div class="meta-row ver-row" onclick="showUpdateTip()" title="点击查看更新说明" style="cursor:pointer">
         <span class="muted">版本</span><span id="verInfo">v1.1.0</span>
       </div>
-      <div class="meta-row"><span class="muted">作者</span><span>po9873</span></div>
+      <div class="meta-row"><span class="muted">作者</span><span>项目维护者</span></div>
     </div>
   </div>`;
   document.querySelectorAll('.tool[data-theme]').forEach(t=>t.classList.toggle('on',t.dataset.theme===(window.__themeMode||'auto')));

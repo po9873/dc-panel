@@ -1,6 +1,6 @@
 # DockerCopilot 助手全家桶
 
-管理 [DockerCopilot](https://github.com/muuua/docker-copilot) 的两种方式，按需选一种即可：
+管理 DockerCopilot 的两种方式，按需选一种即可：
 
 | | 方式一：MP 插件 | 方式二：独立 Docker 面板（本项目） |
 |---|---|---|
@@ -17,15 +17,7 @@
 
 **面板独有**：登录账号（`PANEL_USERNAME`）+ 密码、自定义背景图上传（默认星链粒子动画背景，卡片毛玻璃）、手机端 Apple 风格毛玻璃适配、**独立通知推送**（企业微信群机器人 + Telegram，容器更新成功/失败自动推送，Telegram 可配代理，页面上有一键测试）。
 
-**关于 DC 本体镜像**：
-
-| DC 镜像 | 添加设备/管容器/更新业务容器 | 更新 DC 自己 |
-|---|---|---|
-| [l429609201/dockercopilot](https://github.com/l429609201/dockerCopilot)（增强版，内置自更新旁路容器） | ✅ | ✅ |
-| [muuua/docker-copilot](https://github.com/xcz1997/dockerCopilot)（官方原版） | ✅ | ❌ |
-| 0nlylty/dockercopilot（另一发布线） | ✅ | ❌ |
-
-也就是说：**任何 DockerCopilot 镜像都能被管理和更新业务容器**；只有增强版 `l429609201/dockercopilot` 支持「更新 DC 自己」（其他镜像更新自己的第一步就是停掉自己，没有进程接手重建）。
+面板按 DockerCopilot 提供的标准 API 管理设备和业务容器。更新 DockerCopilot 自身时，只有后端明确提供安全的自更新接管机制才会显示相应入口；普通后端不会被强行停止。
 
 ---
 
@@ -36,7 +28,7 @@
 ```yaml
 services:
   dc-panel:
-    image: po9873/dc-panel:latest   # Docker Hub（也可用 ghcr.io/po9873/dc-panel:latest）
+    image: <dockerhub-user>/dc-panel:latest   # Docker Hub 镜像
     container_name: dc-panel
     restart: unless-stopped
     environment:
@@ -68,14 +60,14 @@ docker run -d --name dc-panel --restart unless-stopped \
   -e PANEL_PASSWORD=<你的密码> \
   -p <宿主机端口>:<容器内端口> \
   -v <宿主机目录>:/data \
-  po9873/dc-panel:latest
+  <dockerhub-user>/dc-panel:latest
 ```
 
-> GHCR 版：把镜像地址换成 `ghcr.io/po9873/dc-panel:latest` 即可，两个仓库内容完全一致。
+> 如果同时发布到其他 OCI Registry，请把示例中的镜像地址替换为你的实际地址。
 
 ### 方式 C：群晖 / 飞牛 / UNRAID 等图形界面
 
-1. 镜像拉取：注册表搜 `dc-panel`（或手动下载 `po9873/dc-panel:latest`）
+1. 镜像拉取：注册表搜 `dc-panel`（或手动下载 `<dockerhub-user>/dc-panel:latest`）
 2. 端口映射：本地 `<宿主机端口>` → 容器 `<容器内端口>`（两者填一样的值最省事）
 3. 环境变量：`PANEL_PASSWORD` = 你的密码（`PANEL_PORT` 与容器内端口保持一致）
 4. 挂载目录：随便一个宿主机目录 → 容器 `/data`（存配置和更新记录）
@@ -86,8 +78,8 @@ docker run -d --name dc-panel --restart unless-stopped \
 GHCR 直连慢时，可套用任意镜像加速前缀拉取，或在 daemon 里配置 `registry-mirrors` 后照常 pull：
 
 ```bash
-docker pull po9873/dc-panel:latest
-# 拉得慢时再套加速前缀：<你的加速站地址>/po9873/dc-panel:latest
+docker pull <dockerhub-user>/dc-panel:latest
+# 拉得慢时再套加速前缀：<你的加速站地址>/<dockerhub-user>/dc-panel:latest
 ```
 
 ### 更新
@@ -97,7 +89,7 @@ docker pull po9873/dc-panel:latest
 ```bash
 docker compose pull && docker compose up -d    # compose 部署
 # 或
-docker pull po9873/dc-panel:latest && docker restart dc-panel   # 部分环境需重建容器
+docker pull <dockerhub-user>/dc-panel:latest && docker restart dc-panel   # 部分环境需重建容器
 ```
 
 > **密码/账号规则（重要）**：
@@ -107,8 +99,8 @@ docker pull po9873/dc-panel:latest && docker restart dc-panel   # 部分环境�
 > - 2FA 密钥同样持久保存在 `/data/panel.json`，与 `/data` 卷一起持久化，重启不丢。
 > - 想恢复"变量接管"：删掉 `/data/panel.json` 里的 `ui_pwd` / `ui_user` 字段（或整个文件重置）后重建容器。
 
-添加 DC 设备时填：**地址**（如 `192.168.1.100:12712`）+ **secretKey**（即该 DC WebUI 的登录密码）。
+添加 DC 设备时填：**地址**（如 `dc-host.example:12712`）+ **secretKey**（即该 DC WebUI 的登录密码）。
 
 ## 方式一：MP 插件
 
-见仓库 👉 [po9873/MoviePilot-Plugins](https://github.com/po9873/MoviePilot-Plugins)（README 有完整安装方法，也已提交官方插件市场 PR）。
+MoviePilot 插件的仓库地址和安装方法请以实际发布仓库为准。
