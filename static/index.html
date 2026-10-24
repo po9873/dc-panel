@@ -299,6 +299,14 @@ body.light .lg-scene .lg-star{opacity:.12}
 .nt-title{font-size:14.5px;font-weight:700;margin-bottom:10px;display:flex;align-items:center;gap:7px}
 .nt-enable{display:flex;align-items:center;gap:7px;font-size:15px;color:var(--txt);margin:0 0 6px;cursor:pointer}
 .nt-enable input{width:auto!important}
+.auto-device-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.auto-device-head .note{margin:0}
+.auto-group{border-top:1px solid rgba(42,54,84,.45);padding-top:10px;margin-top:10px}
+.auto-group-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.auto-group-head .note{margin:0;font-weight:600;color:var(--txt)}
+.auto-actions{display:flex;gap:6px;flex-wrap:wrap}
+.auto-checks{gap:4px 12px;align-items:flex-start}
+button.sm{font-size:13px;padding:4px 9px;border-radius:7px}
 .inp-wrap{position:relative;display:flex;align-items:center}
 .inp-wrap input{padding-right:38px}
 .eye{position:absolute;right:10px;cursor:pointer;font-size:14px;opacity:.5;user-select:none;line-height:1}
@@ -337,11 +345,13 @@ body.light .lg-scene .lg-star{opacity:.12}
   .brand-txt b{font-size:16px}
   .side-brand::after{content:"⚙";margin-left:auto;font-size:18px;color:var(--sub);padding-right:4px}
   .brand-txt small{display:none}
-  .side-nav{display:flex;gap:4px;overflow-x:auto;overflow-y:hidden;padding:0 8px 8px;flex:none;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+  /* 手机导航固定在屏幕内：四个入口优先完整显示，不再把“自动更新”截在右侧 */
+  .side-nav{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:3px;overflow:hidden;padding:0 6px 8px;flex:none;width:100%;-webkit-overflow-scrolling:touch;scrollbar-width:none}
   .side-nav::-webkit-scrollbar{display:none}
-  .side-item{margin:0;white-space:nowrap;border-left:0!important;border-bottom:3px solid transparent;border-radius:8px;padding:8px 12px;font-size:14.5px;flex-shrink:0;gap:6px}
+  .side-item{margin:0;min-width:0;width:100%;white-space:nowrap;border-left:0!important;border-bottom:3px solid transparent;border-radius:8px;padding:8px 4px;font-size:13px;flex:initial;gap:4px;justify-content:center;overflow:hidden}
+  .side-item .lbl{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .side-item.on{border-bottom-color:var(--pri);background:rgba(79,140,255,.14)}
-  .side-item .ic{font-size:15px;width:auto}
+  .side-item .ic{font-size:14px;width:auto;flex:none}
   .side-foot{display:none}
   body.side-collapsed .side .brand-txt,body.side-collapsed .side .side-item .lbl{display:revert}
   body.side-collapsed .side .side-brand,body.side-collapsed .side .side-item{justify-content:flex-start;padding:8px 12px}
@@ -357,6 +367,12 @@ body.light .lg-scene .lg-star{opacity:.12}
   #main,.panes{max-width:100%;overflow-x:hidden;min-width:0}
   body{overflow-x:hidden;max-width:100vw}
   .card h2{flex-wrap:wrap;gap:6px}
+  .auto-group-head{align-items:flex-start;flex-direction:column}
+  .auto-actions{width:100%}
+  .auto-actions button{width:auto!important;flex:1;min-width:0}
+  .auto-checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 8px;width:100%}
+  .auto-checks .nt-enable{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .auto-checks .nt-enable .badge{font-size:11px;padding:1px 5px}
   td,th{white-space:nowrap;padding:8px 6px}
   /* 容器表：名称列截断，避免撑破 */
   .tblwrap table{table-layout:auto}
@@ -487,7 +503,6 @@ body.light .lg-scene .lg-star{opacity:.12}
       <button id="updBtn" onclick="doUpdate()">更新所选</button>
       <span id="updMsg" style="font-size:14px;color:var(--sub)"></span>
     </div>
-    <div class="note">仅 <a href="https://github.com/l429609201/dockerCopilot" target="_blank" style="color:var(--pri)">l429609201/dockercopilot</a>（增强版 DockerCopilot）这个镜像支持「更新自己」；其他容器由对应 DC 正常拉取新镜像重建。</div>
   </div>
 
   </div>
@@ -499,6 +514,24 @@ body.light .lg-scene .lg-star{opacity:.12}
     <div class="tblwrap"><table id="histTable"></table></div>
   </div>
 
+  </div>
+
+  <!-- 自动更新与通知 -->
+  <div class="pane" data-pane="automation">
+  <div class="card">
+    <h2>自动更新与更新通知</h2>
+    <div class="note" style="margin:0 0 12px">按 V1 插件逻辑定时检查 DockerCopilot 的 haveUpdate。只选“更新通知”不会自动更新；选“自动更新”才会实际执行更新。</div>
+    <div id="autoCfg"></div>
+    <div class="row" style="margin-top:12px;flex-wrap:wrap">
+      <button onclick="saveAutomation()">保存自动更新设置</button>
+      <button class="ghost" onclick="runAutomation()">立即检查一次</button>
+      <span id="autoMsg" style="font-size:14px;color:var(--sub)"></span>
+    </div>
+  </div>
+  <div class="card">
+    <h2>每台设备的容器选择</h2>
+    <div id="autoDevices"></div>
+  </div>
   </div>
 
   <!-- 通知推送 -->
@@ -827,7 +860,7 @@ async function doLogin(){
       else $('lmsg').textContent=e.message}
 }
 async function logout(){await api('/api/logout',{method:'POST'});showLogin()}
-async function refresh(){try{await Promise.all([loadDevs(),loadStats(),loadHist(),loadAccount(),loadTfa()])}catch(e){};renderOvDevs()}
+async function refresh(){try{await Promise.all([loadDevs(),loadStats(),loadHist(),loadAccount(),loadTfa(),loadAutomation()])}catch(e){};renderOvDevs()}
 async function loadTfa(){
   try{
     const d=await api('/api/totp');
@@ -847,16 +880,59 @@ async function tfaAct(act){
     await loadTfa();alert(act==='enable'?'2FA 已开启，下次登录需要输入动态码':'2FA 已关闭');
   }catch(e){alert(e.message||'操作失败')}
 }
+let autoData={config:{},devices:[]};
+async function loadAutomation(){
+  try{autoData=await api('/api/automation');renderAutomation()}catch(e){}}
+function renderAutomation(){
+  const c=autoData.config||{};
+  const box=$('autoCfg');if(!box)return;
+  box.innerHTML=`<div class="row" style="flex-wrap:wrap;gap:14px">
+    <label class="nt-enable"><input id="auto-enabled" type="checkbox" ${c.enabled?'checked':''}>启用定时检查</label>
+    <label style="flex:1;min-width:220px">更新通知周期（cron）<input id="auto-update-cron" value="${esc(c.update_cron||'*/15 * * * *')}" placeholder="*/15 * * * *"></label>
+    <label class="nt-enable"><input id="auto-notify" type="checkbox" ${c.update_notify?'checked':''}>发现更新时通知</label>
+  </div>
+  <div class="row" style="flex-wrap:wrap;gap:14px;margin-top:10px">
+    <label style="flex:1;min-width:220px">自动更新周期（留空不自动更新）<input id="auto-auto-cron" value="${esc(c.auto_update_cron||'')}" placeholder="留空关闭"></label>
+    <label class="nt-enable"><input id="auto-auto-notify" type="checkbox" ${c.auto_update_notify?'checked':''}>自动更新开始通知</label>
+    <label class="nt-enable"><input id="auto-success" type="checkbox" ${c.auto_update_success?'checked':''}>更新成功通知</label>
+    <label class="nt-enable"><input id="auto-report" type="checkbox" ${c.schedule_report?'checked':''}>进度汇报</label>
+    <label class="nt-enable"><input id="auto-delete" type="checkbox" ${c.delete_images?'checked':''}>清理镜像</label>
+    <label style="width:110px">轮询间隔（秒）<input id="auto-interval" type="number" min="1" value="${Number(c.interval||10)}"></label>
+    <label style="width:110px">最多轮询次数<input id="auto-limit" type="number" min="1" value="${Number(c.interval_limit||6)}"></label>
+  </div>`;
+  const db=$('autoDevices');if(!db)return;
+  db.innerHTML=(autoData.devices||[]).map(d=>{
+    const sel=(autoData.devices.find(x=>x.id===d.id)||{}).selected||{};
+    const upd=new Set(sel.update||[]), au=new Set(sel.auto_update||[]);
+    const names=(d.containers||[]).map(x=>x.name).filter(Boolean);
+    const group=(cls,label,chosen,extra='')=>`<div class="auto-group"><div class="auto-group-head"><span class="note">${label}</span><span class="auto-actions"><button type="button" class="ghost sm" onclick="setAutomationGroup('${d.id}','${cls}',true)">本机全选</button><button type="button" class="ghost sm" onclick="setAutomationGroup('${d.id}','${cls}',false)">取消全选</button></span></div><div class="row auto-checks">${(d.containers||[]).map(x=>`<label class="nt-enable"><input class="${cls}" data-did="${d.id}" value="${esc(x.name)}" type="checkbox" ${chosen.has(x.name)?'checked':''}>${esc(x.name)}${extra&&x.haveUpdate?' <span class="badge b-warn">可更新</span>':''}</label>`).join('')||'<span class="empty">没有容器</span>'}</div></div>`;
+    return `<div class="card" style="margin:10px 0;padding:12px"><div class="auto-device-head"><b>${esc(d.name)}</b><span class="note">共 ${names.length} 个容器</span></div>
+      ${group('au-upd','更新通知容器',upd,'update')}
+      ${group('au-auto','自动更新容器',au)}</div>`}).join('')||'<div class="empty">还没有设备</div>';
+}
+function setAutomationGroup(did,cls,on){
+  document.querySelectorAll('.'+cls+'[data-did="'+CSS.escape(String(did))+'"]').forEach(x=>x.checked=!!on);
+}
+function collectAutomation(){
+  const c={enabled:$('auto-enabled')?.checked,update_cron:$('auto-update-cron')?.value.trim()||'',update_notify:$('auto-notify')?.checked,auto_update_cron:$('auto-auto-cron')?.value.trim()||'',auto_update_notify:$('auto-auto-notify')?.checked,auto_update_success:$('auto-success')?.checked,schedule_report:$('auto-report')?.checked,delete_images:$('auto-delete')?.checked,interval:Number($('auto-interval')?.value||10),interval_limit:Number($('auto-limit')?.value||6)};
+  const ds={};
+  document.querySelectorAll('.au-upd:checked').forEach(x=>(ds[x.dataset.did]??={update:[],auto_update:[]}).update.push(x.value));
+  document.querySelectorAll('.au-auto:checked').forEach(x=>(ds[x.dataset.did]??={update:[],auto_update:[]}).auto_update.push(x.value));
+  return {config:c,devices:ds};
+}
+async function saveAutomation(){try{await api('/api/automation',{method:'PUT',body:JSON.stringify(collectAutomation())});$('autoMsg').textContent='✓ 自动更新设置已保存';loadAutomation()}catch(e){$('autoMsg').textContent='✗ '+e.message}}
+async function runAutomation(){try{await api('/api/automation/run',{method:'POST'});$('autoMsg').textContent='✓ 已立即检查';loadHist();loadStats();loadAutomation()}catch(e){$('autoMsg').textContent='✗ '+e.message}}
+
 function renderUpdLog(){
   const tb=$('updTable');if(!tb)return;
   const h=histAll.slice(0,8);
   const ok=h.filter(x=>x.status==='成功').length, fail=h.filter(x=>x.status==='失败').length;
   if($('updSummary'))$('updSummary').textContent=histAll.length?`最近 ${Math.min(8,histAll.length)} 条 · 成功 ${ok} · 失败 ${fail}`:'';
   tb.innerHTML=h.length?`<tr><th>时间</th><th class="hide-m">设备</th><th>容器</th><th class="hide-m">镜像</th><th>结果</th></tr>`+h.map(r=>{
-    const bad=r.status==='失败';
+    const bad=r.status==='失败', pending=['可更新','进行中','已触发','进度','已完成（未确认结果）'].includes(r.status);
     return `<tr><td style="white-space:nowrap">${esc((r.time||'').slice(5))}</td><td class="hide-m">${esc(r.device)}</td>
     <td><b>${esc(r.container)}</b></td><td class="hide-m" style="color:var(--sub);font-size:14px">${esc(r.image)}</td>
-    <td><span class="badge ${bad?'b-no':'b-ok'}" title="${esc(r.message||r.progress||'')}">${esc(r.status)}${r.progress?' '+esc(r.progress):''}</span></td></tr>`;
+    <td><span class="badge ${bad?'b-no':pending?'b-warn':'b-ok'}" title="${esc(r.message||r.progress||'')}">${esc(r.status)}${r.progress?' '+esc(r.progress):''}</span></td></tr>`;
   }).join(''):'<tr><td class="empty">还没有更新记录，去容器页选容器点「更新」</td></tr>';
 }
 function renderOvDevs(){
@@ -1208,6 +1284,7 @@ const MENU=[
  {id:'overview',name:'概览',ic:'📊'},
  {id:'containers',name:'容器',ic:'🗃️'},
  {id:'history',name:'更新记录',ic:'🕘'},
+ {id:'automation',name:'自动更新',ic:'🔄'},
  {id:'notify',name:'通知推送',ic:'🔔'},
  {id:'settings',name:'设置',ic:'⚙️'}
 ];
@@ -1287,6 +1364,7 @@ function switchPane(id){
   curPane=id;renderSide();
   document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('on',p.dataset.pane===id));
   if(id==='containers'&&curDev)loadContainers();
+  if(id==='automation')loadAutomation();
   window.scrollTo({top:0,behavior:'smooth'});
 }
 function esc(s){return String(s??'').replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]))}
