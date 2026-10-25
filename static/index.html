@@ -316,9 +316,9 @@ button.sm{font-size:13px;padding:4px 9px;border-radius:7px}
 .eye:hover{opacity:1}
 @media(max-width:820px){
   .rsz-h{display:none}
-  .wrap{padding:10px;padding-left:max(10px,env(safe-area-inset-left));padding-right:max(10px,env(safe-area-inset-right));padding-bottom:calc(24px + env(safe-area-inset-bottom))}.hide-m{display:none}td,th{padding:8px 6px}
+  .wrap{padding-top:calc(10px + env(safe-area-inset-top));padding-left:max(10px,env(safe-area-inset-left));padding-right:max(10px,env(safe-area-inset-right));padding-bottom:calc(24px + env(safe-area-inset-bottom))}.hide-m{display:none}td,th{padding:8px 6px}
   .card{padding:14px;border-radius:14px;backdrop-filter:blur(24px) saturate(1.6);-webkit-backdrop-filter:blur(24px) saturate(1.6);background:rgba(20,27,44,.58);box-shadow:0 10px 36px rgba(0,0,0,.42)}
-  #login{margin:8vh auto;padding:22px 18px;backdrop-filter:blur(28px) saturate(1.8);-webkit-backdrop-filter:blur(28px) saturate(1.8)}
+  #login{margin:max(8vh,calc(16px + env(safe-area-inset-top))) auto;padding:22px 18px;backdrop-filter:blur(28px) saturate(1.8);-webkit-backdrop-filter:blur(28px) saturate(1.8)}
   button{padding:11px 16px;font-size:14px;border-radius:10px}
   button.ghost,button.danger{border-width:1.5px}
   /* 手机上表单全部纵排，宽度拉满 */
@@ -340,7 +340,7 @@ button.sm{font-size:13px;padding:4px 9px;border-radius:7px}
   .card h2{font-size:15.5px}
   .note{font-size:14px;line-height:1.6}
   /* ===== 手机/平板：顶部品牌条 + 横向滚动导航，内容在下方 ===== */
-  .wrap{grid-template-columns:minmax(0,1fr)!important;gap:10px;padding:10px 10px 24px;max-width:100%;width:100%;box-sizing:border-box}
+  .wrap{grid-template-columns:minmax(0,1fr)!important;gap:10px;padding:calc(10px + env(safe-area-inset-top)) 10px calc(24px + env(safe-area-inset-bottom));max-width:100%;width:100%;box-sizing:border-box}
   .wrap>*{min-width:0;max-width:100%}
   .side{display:flex;flex-direction:column;height:auto!important;position:static;z-index:auto;border-radius:14px;overflow:hidden;padding:0;width:100%;max-width:100%;box-sizing:border-box}
   .side-brand{padding:10px 14px;border-bottom:none}
@@ -407,7 +407,7 @@ button.sm{font-size:13px;padding:4px 9px;border-radius:7px}
     </div>
     <div class="um-list">
       <div class="um-item" onclick="closeAppearance();switchPane('settings')"><span class="umi">⚙️</span><span class="umt">系统设置</span><span class="uma">›</span></div>
-      <div class="um-item" onclick="showUpdateTip()"><span class="umi">🔄</span><span class="umt">检查更新</span><span class="umv" id="umVer">v1.2.0</span><span class="uma">›</span></div>
+      <div class="um-item" onclick="showUpdateTip()"><span class="umi">🔄</span><span class="umt">检查更新</span><span class="umv" id="umVer">v1.2.1</span><span class="uma">›</span></div>
     </div>
     <div class="um-list">
       <div class="um-item um-danger" onclick="closeAppearance();logout()"><span class="umi">⏏</span><span class="umt">退出登录</span></div>
@@ -1322,7 +1322,7 @@ function renderSide(){
     <div class="side-logout" onclick="logout()"><span class="li">⏏</span><span class="lbl">退出登录</span></div>
     <div class="side-meta">
       <div class="meta-row ver-row" onclick="showUpdateTip()" title="点击查看更新说明" style="cursor:pointer">
-        <span class="muted">版本</span><span id="verInfo">v1.2.0</span>
+        <span class="muted">版本</span><span id="verInfo">v1.2.1</span>
       </div>
       <div class="meta-row"><span class="muted">作者</span><span>po9873</span></div>
     </div>
