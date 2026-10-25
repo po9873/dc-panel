@@ -209,6 +209,9 @@ td{padding:8px 6px;border-bottom:1px solid rgba(42,54,84,.4)}
 .badge{display:inline-block;padding:2px 10px;border-radius:20px;font-size:14px}
 .b-ok{background:rgba(61,220,132,.15);color:var(--ok)}
 .b-no{background:rgba(255,107,107,.15);color:var(--err)}
+.hbtn{background:var(--card2);color:var(--sub);border:1px solid var(--line);border-radius:6px;padding:3px 10px;font-size:13px;cursor:pointer;line-height:1.4}
+.hbtn:hover{color:var(--txt);border-color:var(--pri)}
+.hbtn-danger:hover{color:var(--err);border-color:var(--err)}
 .b-warn{background:rgba(255,183,77,.15);color:var(--warn)}
 .b-info{background:rgba(79,140,255,.15);color:var(--pri)}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
@@ -404,7 +407,7 @@ button.sm{font-size:13px;padding:4px 9px;border-radius:7px}
     </div>
     <div class="um-list">
       <div class="um-item" onclick="closeAppearance();switchPane('settings')"><span class="umi">⚙️</span><span class="umt">系统设置</span><span class="uma">›</span></div>
-      <div class="um-item" onclick="showUpdateTip()"><span class="umi">🔄</span><span class="umt">检查更新</span><span class="umv" id="umVer">v1.1.0</span><span class="uma">›</span></div>
+      <div class="um-item" onclick="showUpdateTip()"><span class="umi">🔄</span><span class="umt">检查更新</span><span class="umv" id="umVer">v1.2.0</span><span class="uma">›</span></div>
     </div>
     <div class="um-list">
       <div class="um-item um-danger" onclick="closeAppearance();logout()"><span class="umi">⏏</span><span class="umt">退出登录</span></div>
@@ -510,7 +513,12 @@ button.sm{font-size:13px;padding:4px 9px;border-radius:7px}
   <!-- 记录 -->
   <div class="pane" data-pane="history">
   <div class="card">
-    <h2>更新记录 <span style="font-size:14px;color:var(--sub)" id="histRange"></span></h2>
+    <h2>更新记录 <span style="font-size:14px;color:var(--sub)" id="histRange"></span>
+      <span style="flex:1"></span>
+      <button class="hbtn" onclick="clearHist('older30')" title="删除 30 天前的记录">清理30天前</button>
+      <button class="hbtn" onclick="clearHist('success')" title="删除所有状态为成功的记录">清理成功记录</button>
+      <button class="hbtn hbtn-danger" onclick="clearHist('all')" title="删除全部更新记录">清空全部</button>
+    </h2>
     <div class="tblwrap"><table id="histTable"></table></div>
   </div>
 
@@ -1263,22 +1271,32 @@ function renderHist(){
   const total=Math.max(1,Math.ceil(histAll.length/PAGE_SIZE));
   if(histPage>total)histPage=total;
   const rows=histAll.slice((histPage-1)*PAGE_SIZE,histPage*PAGE_SIZE);
-  let html=`<tr><th>时间</th><th class="hide-m">设备</th><th>容器</th><th>结果</th></tr>`;
+  let html=`<tr><th>时间</th><th class="hide-m">设备</th><th>容器</th><th>结果</th><th style="width:44px">操作</th></tr>`;
   html+=rows.length?rows.map(r=>`<tr><td style="white-space:nowrap">${esc(r.time)}</td><td class="hide-m">${esc(r.device)}</td>
-    <td>${esc(r.container)}</td><td><span class="badge ${r.status==='成功'?'b-ok':r.status==='失败'?'b-no':'b-warn'}">${esc(r.status)}${r.progress?' '+esc(r.progress):''}</span></td></tr>`).join(''):'<tr><td colspan="4"><div class="empty">暂无记录</div></td></tr>';
+    <td>${esc(r.container)}</td><td><span class="badge ${r.status==='成功'?'b-ok':r.status==='失败'?'b-no':'b-warn'}">${esc(r.status)}${r.progress?' '+esc(r.progress):''}</span></td>
+    <td><button class="hbtn" onclick="delHist('${r.id}')" title="删除这条记录">🗑</button></td></tr>`).join(''):'<tr><td colspan="5"><div class="empty">暂无记录</div></td></tr>';
   if(total>1){
     let pages='';
     for(let p=1;p<=total;p++){
       if(total>7&&p>2&&p<total&&Math.abs(p-histPage)>1){if(!pages.endsWith('<span class="pg gap">…</span>'))pages+='<span class="pg gap">…</span>';continue}
       pages+=`<span class="pg ${p===histPage?'on':''}" onclick="histPage=${p};renderHist()">${p}</span>`;
     }
-    html+=`<tr><td colspan="4"><div class="pager">
+    html+=`<tr><td colspan="5"><div class="pager">
       <span class="pg" onclick="if(histPage>1){histPage--;renderHist()}">‹</span>
       ${pages}
       <span class="pg" onclick="if(histPage<${total}){histPage++;renderHist()}">›</span>
       <span style="color:var(--sub);font-size:14px;margin-left:10px">共 ${histAll.length} 条</span></div></td></tr>`;
   }
   $('histTable').innerHTML=html;
+}
+async function delHist(id){
+  if(!id||!confirm('确定删除这条更新记录？'))return;
+  try{await api('/api/history/'+encodeURIComponent(id),{method:'DELETE'});loadHist();loadStats();}catch(e){alert('删除失败：'+e.message)}
+}
+async function clearHist(scope){
+  const label={all:'全部记录',older30:'30 天前的记录',success:'所有成功记录',failed:'所有失败记录'}[scope]||'记录';
+  if(!confirm(`确定删除${label}？此操作不可恢复。`))return;
+  try{const d=await api('/api/history?scope='+scope,{method:'DELETE'});loadHist();loadStats();}catch(e){alert('清理失败：'+e.message)}
 }
 const MENU=[
  {id:'overview',name:'概览',ic:'📊'},
@@ -1304,9 +1322,9 @@ function renderSide(){
     <div class="side-logout" onclick="logout()"><span class="li">⏏</span><span class="lbl">退出登录</span></div>
     <div class="side-meta">
       <div class="meta-row ver-row" onclick="showUpdateTip()" title="点击查看更新说明" style="cursor:pointer">
-        <span class="muted">版本</span><span id="verInfo">v1.1.0</span>
+        <span class="muted">版本</span><span id="verInfo">v1.2.0</span>
       </div>
-      <div class="meta-row"><span class="muted">作者</span><span>项目维护者</span></div>
+      <div class="meta-row"><span class="muted">作者</span><span>po9873</span></div>
     </div>
   </div>`;
   document.querySelectorAll('.tool[data-theme]').forEach(t=>t.classList.toggle('on',t.dataset.theme===(window.__themeMode||'auto')));
