@@ -80,6 +80,10 @@ AUTOMATION_DEFAULTS = {
     "delete_images": False,
     "interval": 10,
     "interval_limit": 6,
+    # 面板自身新版本自检：独立于上面的定时检查开关，间隔分钟数可在设置里调，
+    # 改后下一次循环（≤20 秒）即按新间隔生效，无需重启。
+    "self_check_interval": 5,
+    "self_update_notify": True,
 }
 AUTOMATION_TASK = None
 AUTOMATION_LAST_RUN = {"update": "", "auto": ""}
@@ -91,6 +95,11 @@ def _automation_config() -> dict:
     out.update({k: v for k, v in cfg.items() if k in out})
     out["interval"] = max(1, int(out.get("interval") or 10))
     out["interval_limit"] = max(1, int(out.get("interval_limit") or 6))
+    try:
+        out["self_check_interval"] = max(1, int(out.get("self_check_interval")))
+    except (TypeError, ValueError):
+        out["self_check_interval"] = 5
+    out["self_update_notify"] = bool(out.get("self_update_notify", True))
     return out
 
 
@@ -499,7 +508,7 @@ async def status(request: Request):
 # ---------- 面板自身更新检测（Docker Hub） ----------
 
 HUB_REPO = os.environ.get("PANEL_HUB_REPO", "<dockerhub-user>/dc-panel")
-APP_VERSION = "v1.2.2"
+APP_VERSION = "v1.2.3"
 
 def _boot_time():
     try:
@@ -510,23 +519,70 @@ def _boot_time():
     except Exception:
         return datetime.now(timezone.utc) - timedelta(days=3650)
 
-@app.get("/api/version/check")
-async def version_check():
-    """对照 Docker Hub latest 的构建时间与容器启动时间，判断面板是否有新版。"""
-    result = {"current": APP_VERSION, "repo": HUB_REPO, "update": False, "hub_time": None}
+# 面板自身版本自检状态（进程内）。checked_at 用于节流：前端定时轮询命中
+# /api/version/check 时直接读缓存，不会反复打 Docker Hub；真正按用户设置的
+# 间隔查询由 _automation_loop 完成——间隔改后下一次循环（≤20 秒）即生效。
+PANEL_UPDATE_STATE = {
+    "current": APP_VERSION, "repo": HUB_REPO,
+    "update": False, "hub_time": None,
+    "checked_at": 0.0, "notified_hub_time": None,
+}
+PANEL_UPDATE_CACHE_TTL = 60.0
+
+
+async def _notify_panel_update(hub_time):
+    """发现新版本且该版本尚未通知过时，按已启用的通道推送一次。"""
+    state = PANEL_UPDATE_STATE
+    if state["notified_hub_time"] == hub_time:
+        return
+    state["notified_hub_time"] = hub_time
+    record = {
+        "id": secrets.token_hex(6), "time": _record_time(), "device": "本机",
+        "container": "dc-panel", "image": f"{HUB_REPO}:latest",
+        "status": "可更新", "source": "面板自检",
+        "message": f"Docker Hub 已发布新镜像（构建于 {hub_time}），当前容器启动于更早版本",
+    }
+    await notify_update(record)
+
+
+async def _check_panel_update(notify: bool = False) -> dict:
+    """对照 Docker Hub latest 的构建时间与容器启动时间，判断面板是否有新版。
+
+    notify=True 时（仅后台循环调用）在发现新版本、且该版本尚未通知过时，
+    按已启用的通道推送一次；前端轮询只读结果，不重复通知。
+    缓存命中（60 秒内已查过）时也处理通知，避免前端轮询刚好刷新缓存
+    导致后台循环错过这一轮。
+    """
+    state = PANEL_UPDATE_STATE
+    state["current"] = APP_VERSION
+    state["repo"] = HUB_REPO
+    now_ts = time.time()
+    if state["checked_at"] and (now_ts - state["checked_at"]) < PANEL_UPDATE_CACHE_TTL:
+        if notify and state["update"]:
+            await _notify_panel_update(state["hub_time"])
+        return state
+    update, hub_time = False, None
     try:
         async with httpx.AsyncClient(timeout=8) as cli:
             r = await cli.get(f"https://hub.docker.com/v2/repositories/{HUB_REPO}/tags/latest")
             if r.status_code == 200:
                 d = r.json()
-                pushed = d.get("last_updated") or d.get("tag_last_pushed")
-                result["hub_time"] = pushed
-                if pushed:
-                    hub_dt = datetime.fromisoformat(pushed.replace("Z", "+00:00"))
-                    result["update"] = hub_dt > _boot_time()
+                hub_time = d.get("last_updated") or d.get("tag_last_pushed")
+                if hub_time:
+                    update = datetime.fromisoformat(hub_time.replace("Z", "+00:00")) > _boot_time()
     except Exception:
         pass
-    return result
+    state.update({"update": update, "hub_time": hub_time, "checked_at": now_ts})
+    if notify and update:
+        await _notify_panel_update(hub_time)
+    return state
+
+
+@app.get("/api/version/check")
+async def version_check():
+    state = await _check_panel_update()
+    return {"current": state["current"], "repo": state["repo"],
+            "update": state["update"], "hub_time": state["hub_time"]}
 
 
 # ---------- 背景图（深浅主题各一套） ----------
@@ -699,6 +755,7 @@ async def list_containers(device_id: str, request: Request):
 async def _automation_loop():
     """独立于浏览器的周期扫描：发现 DC 返回 haveUpdate=true 就记录并通知。"""
     global AUTOMATION_LAST_RUN
+    last_self_check = 0.0
     while True:
         try:
             cfg = _automation_config()
@@ -712,6 +769,14 @@ async def _automation_loop():
                 if AUTOMATION_LAST_RUN.get("auto") != minute_key:
                     AUTOMATION_LAST_RUN["auto"] = minute_key
                     await _scan_updates(auto=True)
+            # 面板自身新版本检查：不受 enabled 限制（这是面板自己的事），
+            # 间隔取设置里的 self_check_interval（分钟），每轮循环实时读取，
+            # 用户在 UI 改完下一次循环即生效，无需重启。
+            now_ts = time.time()
+            interval = max(1, int(cfg.get("self_check_interval") or 5)) * 60
+            if now_ts - last_self_check >= interval:
+                last_self_check = now_ts
+                await _check_panel_update(notify=bool(cfg.get("self_update_notify", True)))
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1010,10 +1075,14 @@ async def set_automation(request: Request):
         if k in incoming:
             cfg[k] = incoming[k]
     cfg["enabled"] = bool(cfg.get("enabled"))
-    for key in ("update_notify", "auto_update_notify", "auto_update_success", "schedule_report", "delete_images"):
+    for key in ("update_notify", "auto_update_notify", "auto_update_success", "schedule_report", "delete_images", "self_update_notify"):
         cfg[key] = bool(cfg.get(key))
     cfg["interval"] = max(1, int(cfg.get("interval") or 10))
     cfg["interval_limit"] = max(1, int(cfg.get("interval_limit") or 6))
+    try:
+        cfg["self_check_interval"] = max(1, int(cfg.get("self_check_interval")))
+    except (TypeError, ValueError):
+        cfg["self_check_interval"] = 5
     for key in ("update_cron", "auto_update_cron"):
         expr = str(cfg.get(key) or "").strip()
         if expr:
@@ -1142,6 +1211,8 @@ async def export_config(request: Request):
             "delete_images": bool(automation.get("delete_images")),
             "interval": automation.get("interval", 10),
             "interval_limit": automation.get("interval_limit", 6),
+            "self_check_interval": automation.get("self_check_interval", 5),
+            "self_update_notify": bool(automation.get("self_update_notify", True)),
         },
     }
     data = json.dumps(payload, ensure_ascii=False, indent=2)
