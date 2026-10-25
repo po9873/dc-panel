@@ -59,6 +59,15 @@ def _add_history(record: dict):
     _save(HISTORY_FILE, h[:2000])
 
 
+DELETED_HISTORY_IDS: set = set()  # 用户手动删除过的记录 ID，防止后台轮询结束后又写回
+
+
+def _mark_deleted(record_id: str):
+    DELETED_HISTORY_IDS.add(record_id)
+    if len(DELETED_HISTORY_IDS) > 5000:  # 防御性上限，避免无限增长
+        DELETED_HISTORY_IDS.clear()
+
+
 AUTOMATION_STATE_FILE = DATA_DIR / "automation_state.json"
 AUTOMATION_DEFAULTS = {
     "enabled": True,
@@ -490,7 +499,7 @@ async def status(request: Request):
 # ---------- 面板自身更新检测（Docker Hub） ----------
 
 HUB_REPO = os.environ.get("PANEL_HUB_REPO", "<dockerhub-user>/dc-panel")
-APP_VERSION = "v1.1.0"
+APP_VERSION = "v1.2.0"
 
 def _boot_time():
     try:
@@ -813,6 +822,22 @@ async def _scan_device_updates(device: dict, containers: list, client, cfg: dict
 
 # ---------- 更新 ----------
 
+async def _confirm_container_updated(client, device: dict, container_name: str):
+    """DC 自更新会重启自身，内存里的进度记录随之丢失，/api/progress 报
+    "taskID 未找到"。此时回查容器列表：haveUpdate 消失即更新已完成。
+    返回 True=已完成 / False=仍标记可更新 / None=暂无法确认。"""
+    if not container_name:
+        return None
+    try:
+        data = await dc_get(client, device, "/api/containers")
+    except Exception:
+        return None
+    for c in _container_array(data):
+        if str(c.get("name") or c.get("id") or "").strip() == container_name:
+            return not _is_true(c.get("haveUpdate"))
+    return None
+
+
 async def _poll_progress(device: dict, task_id: str, record: dict, automation_cfg: dict = None):
     """后台轮询更新进度，兼容 DC 的 code/msg 和 status/progress 两种返回格式。"""
     cfg = automation_cfg or {}
@@ -835,6 +860,31 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
                 code = p.get("code")
                 percentage = detail.get("percentage", p.get("percentage"))
                 detail_msg = str(detail.get("detailMsg") or detail.get("message") or msg)
+                # DC 的进度记录在内存中：更新 dockercopilot 自身会导致 DC 重启、
+                # 进度记录被清空，/api/progress 返回 400 "taskID 未找到"。
+                # 这不是更新失败——回查容器状态确认真实结果，避免误报。
+                task_lost = code not in (None, 0, 200) and (
+                    "未找到" in msg or "not found" in msg.lower())
+                if task_lost:
+                    confirmed = await _confirm_container_updated(client, device, record.get("container", ""))
+                    if confirmed is True:
+                        record["status"] = "成功"
+                        record["message"] = "更新已完成（DC 重启后进度记录已清除，经容器状态确认）"
+                        record.pop("progress", None)
+                        if cfg.get("auto_update_success", True):
+                            await notify_update(record)
+                            final_notified = True
+                        break
+                    if confirmed is False:
+                        record["status"] = "失败"
+                        record["message"] = "DockerCopilot 更新任务不存在，且容器仍标记为可更新"
+                        record.pop("progress", None)
+                        if cfg.get("auto_update_success", True):
+                            await notify_update(record)
+                            final_notified = True
+                        break
+                    # 容器列表也查不到（DC 可能正在重启）：继续轮询，不误判
+                    continue
                 if percentage is not None:
                     record["progress"] = f"{percentage}% {detail_msg}".strip()
                 else:
@@ -876,6 +926,9 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
 
 
 def _refresh_history(record: dict):
+    # 用户手动删除过的记录不再被后台轮询写回
+    if record.get("id") in DELETED_HISTORY_IDS:
+        return
     h = _history()
     for i, r in enumerate(h):
         if r.get("id") == record["id"]:
@@ -999,6 +1052,45 @@ async def get_history(request: Request, days: int = 30):
     start = (datetime.now(tz).date() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
     h = [r for r in _history() if r.get("time", "")[:10] >= start]
     return {"start": start, "records": h[:300]}
+
+
+@app.delete("/api/history/{record_id}")
+async def delete_history(request: Request, record_id: str):
+    """删除单条更新记录。"""
+    _check_login(request)
+    h = _history()
+    left = [r for r in h if r.get("id") != record_id]
+    if len(left) == len(h):
+        raise HTTPException(404, "记录不存在或已删除")
+    _mark_deleted(record_id)
+    _save(HISTORY_FILE, left)
+    return {"ok": True, "deleted": 1, "remaining": len(left)}
+
+
+@app.delete("/api/history")
+async def clear_history(request: Request, scope: str = "all"):
+    """批量清理更新记录。scope: all=全部 / older30=30 天前 / success=成功 / failed=失败"""
+    _check_login(request)
+    h = _history()
+    tz = timezone(timedelta(hours=8))
+    if scope == "older30":
+        cutoff = (datetime.now(tz).date() - timedelta(days=30)).strftime("%Y-%m-%d")
+        left = [r for r in h if r.get("time", "")[:10] >= cutoff]
+    elif scope == "success":
+        left = [r for r in h if r.get("status") != "成功"]
+    elif scope == "failed":
+        left = [r for r in h if r.get("status") != "失败"]
+    elif scope == "all":
+        left = []
+    else:
+        raise HTTPException(400, "不支持的清理范围")
+    left_ids = {str(r.get("id") or "") for r in left}
+    for r in h:
+        rid = str(r.get("id") or "")
+        if rid not in left_ids:
+            _mark_deleted(rid)
+    _save(HISTORY_FILE, left)
+    return {"ok": True, "deleted": len(h) - len(left), "remaining": len(left)}
 
 
 @app.get("/api/stats")
