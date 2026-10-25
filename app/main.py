@@ -499,7 +499,7 @@ async def status(request: Request):
 # ---------- 面板自身更新检测（Docker Hub） ----------
 
 HUB_REPO = os.environ.get("PANEL_HUB_REPO", "<dockerhub-user>/dc-panel")
-APP_VERSION = "v1.2.1"
+APP_VERSION = "v1.2.2"
 
 def _boot_time():
     try:
