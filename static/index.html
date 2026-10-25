@@ -407,7 +407,7 @@ button.sm{font-size:13px;padding:4px 9px;border-radius:7px}
     </div>
     <div class="um-list">
       <div class="um-item" onclick="closeAppearance();switchPane('settings')"><span class="umi">⚙️</span><span class="umt">系统设置</span><span class="uma">›</span></div>
-      <div class="um-item" onclick="showUpdateTip()"><span class="umi">🔄</span><span class="umt">检查更新</span><span class="umv" id="umVer">v1.2.1</span><span class="uma">›</span></div>
+      <div class="um-item" onclick="showUpdateTip()"><span class="umi">🔄</span><span class="umt">检查更新</span><span class="umv" id="umVer">v1.2.2</span><span class="uma">›</span></div>
     </div>
     <div class="um-list">
       <div class="um-item um-danger" onclick="closeAppearance();logout()"><span class="umi">⏏</span><span class="umt">退出登录</span></div>
@@ -713,7 +713,7 @@ async function api(path,opt={}){
   return d;
 }
 function showLogin(){$('login').style.display='block';$('main').style.display='none';applyBg();fetch("/api/2fa-required").then(r=>r.json()).then(d=>{$("twoFaRow").style.display=d.enabled?"block":"none";if(d.enabled)setTimeout(()=>$("lcode").focus(),200)}).catch(()=>{})}
-function showMain(){$('login').style.display='none';$('main').style.display='block';renderSide();refresh();checkPanelUpdate();applyBg()}
+function showMain(){$('login').style.display='none';$('main').style.display='block';renderSide();refresh();checkPanelUpdate();applyBg();dcpWatchVersion()}
 async function checkPanelUpdate(){
   try{
     const d=await api('/api/version/check');
@@ -725,6 +725,30 @@ async function checkPanelUpdate(){
 function showUpdateTip(){
   const upd=$('verInfo')&&$('verInfo').querySelector('.upd-badge');
   if(upd)alert('面板有新版本！\n\n请在部署面板的主机上执行对应的 compose pull/up 命令，完成后刷新页面即可。');
+}
+/* ===== 版本自愈：iOS PWA 从后台恢复窗口时不重载 DOM（通知点击/主屏图标恢复都是旧 UI）。
+   切回前台、bfcache 恢复、收到 sw 刷新指令时校验版本，不一致就整体刷新。 ===== */
+let _dcpVerT=0;
+async function dcpCheckVersion(force){
+  const now=Date.now();
+  if(!force&&now-_dcpVerT<3000)return;
+  _dcpVerT=now;
+  try{
+    const d=await api('/api/version/check');
+    const cur=d.current||'';
+    if(!cur)return;
+    const local=localStorage.getItem('dcp-ver');
+    if(local&&local!==cur){localStorage.setItem('dcp-ver',cur);location.reload();}
+    else if(!local)localStorage.setItem('dcp-ver',cur);
+  }catch(e){}
+}
+function dcpWatchVersion(){
+  document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')dcpCheckVersion();});
+  window.addEventListener('pageshow',e=>{if(e.persisted)dcpCheckVersion();});
+  if(navigator.serviceWorker)navigator.serviceWorker.addEventListener('message',e=>{
+    if(e.data&&e.data.type==='dcp-reload')location.reload();
+  });
+  dcpCheckVersion(true);
 }
 function _curTheme(){
   const m=window.__themeMode||'dark';
@@ -1322,7 +1346,7 @@ function renderSide(){
     <div class="side-logout" onclick="logout()"><span class="li">⏏</span><span class="lbl">退出登录</span></div>
     <div class="side-meta">
       <div class="meta-row ver-row" onclick="showUpdateTip()" title="点击查看更新说明" style="cursor:pointer">
-        <span class="muted">版本</span><span id="verInfo">v1.2.1</span>
+        <span class="muted">版本</span><span id="verInfo">v1.2.2</span>
       </div>
       <div class="meta-row"><span class="muted">作者</span><span>po9873</span></div>
     </div>
