@@ -407,7 +407,7 @@ button.sm{font-size:13px;padding:4px 9px;border-radius:7px}
     </div>
     <div class="um-list">
       <div class="um-item" onclick="closeAppearance();switchPane('settings')"><span class="umi">⚙️</span><span class="umt">系统设置</span><span class="uma">›</span></div>
-      <div class="um-item" onclick="showUpdateTip()"><span class="umi">🔄</span><span class="umt">检查更新</span><span class="umv" id="umVer">v1.2.2</span><span class="uma">›</span></div>
+      <div class="um-item" onclick="showUpdateTip()"><span class="umi">🔄</span><span class="umt">检查更新</span><span class="umv" id="umVer">v1.2.3</span><span class="uma">›</span></div>
     </div>
     <div class="um-list">
       <div class="um-item um-danger" onclick="closeAppearance();logout()"><span class="umi">⏏</span><span class="umt">退出登录</span></div>
@@ -720,8 +720,13 @@ async function checkPanelUpdate(){
     const el=$('verInfo');
     if(!el)return;
     if(d.update){el.innerHTML='<span class="upd-badge">可更新</span>';el.parentElement.title='Docker Hub 有新镜像，点击查看更新方法'}
+    else if(el.querySelector('.upd-badge')){el.textContent=d.current||'';el.parentElement.title='点击查看更新说明'}
   }catch(e){}
 }
+/* 定时轮询版本检查：后端带 60s 缓存 + 后台循环按用户设置的间隔查 Docker Hub，
+   前端只读结果，所以这里 60 秒一次不会给 Hub 造成压力；页面开着不动也能
+   自动发现新版本并亮徽章，不需要手动刷新。 */
+setInterval(checkPanelUpdate,60000);
 function showUpdateTip(){
   const upd=$('verInfo')&&$('verInfo').querySelector('.upd-badge');
   if(upd)alert('面板有新版本！\n\n请在部署面板的主机上执行对应的 compose pull/up 命令，完成后刷新页面即可。');
@@ -931,6 +936,8 @@ function renderAutomation(){
     <label class="nt-enable"><input id="auto-delete" type="checkbox" ${c.delete_images?'checked':''}>清理镜像</label>
     <label style="width:110px">轮询间隔（秒）<input id="auto-interval" type="number" min="1" value="${Number(c.interval||10)}"></label>
     <label style="width:110px">最多轮询次数<input id="auto-limit" type="number" min="1" value="${Number(c.interval_limit||6)}"></label>
+    <label style="width:170px">面板自检间隔（分钟）<input id="auto-self-interval" type="number" min="1" value="${Number(c.self_check_interval||5)}"></label>
+    <label class="nt-enable"><input id="auto-self-notify" type="checkbox" ${c.self_update_notify?'checked':''}>发现新版本时通知</label>
   </div>`;
   const db=$('autoDevices');if(!db)return;
   db.innerHTML=(autoData.devices||[]).map(d=>{
@@ -946,7 +953,7 @@ function setAutomationGroup(did,cls,on){
   document.querySelectorAll('.'+cls+'[data-did="'+CSS.escape(String(did))+'"]').forEach(x=>x.checked=!!on);
 }
 function collectAutomation(){
-  const c={enabled:$('auto-enabled')?.checked,update_cron:$('auto-update-cron')?.value.trim()||'',update_notify:$('auto-notify')?.checked,auto_update_cron:$('auto-auto-cron')?.value.trim()||'',auto_update_notify:$('auto-auto-notify')?.checked,auto_update_success:$('auto-success')?.checked,schedule_report:$('auto-report')?.checked,delete_images:$('auto-delete')?.checked,interval:Number($('auto-interval')?.value||10),interval_limit:Number($('auto-limit')?.value||6)};
+  const c={enabled:$('auto-enabled')?.checked,update_cron:$('auto-update-cron')?.value.trim()||'',update_notify:$('auto-notify')?.checked,auto_update_cron:$('auto-auto-cron')?.value.trim()||'',auto_update_notify:$('auto-auto-notify')?.checked,auto_update_success:$('auto-success')?.checked,schedule_report:$('auto-report')?.checked,delete_images:$('auto-delete')?.checked,interval:Number($('auto-interval')?.value||10),interval_limit:Number($('auto-limit')?.value||6),self_check_interval:Number($('auto-self-interval')?.value||5),self_update_notify:$('auto-self-notify')?.checked};
   const ds={};
   document.querySelectorAll('.au-upd:checked').forEach(x=>(ds[x.dataset.did]??={update:[],auto_update:[]}).update.push(x.value));
   document.querySelectorAll('.au-auto:checked').forEach(x=>(ds[x.dataset.did]??={update:[],auto_update:[]}).auto_update.push(x.value));
@@ -1346,7 +1353,7 @@ function renderSide(){
     <div class="side-logout" onclick="logout()"><span class="li">⏏</span><span class="lbl">退出登录</span></div>
     <div class="side-meta">
       <div class="meta-row ver-row" onclick="showUpdateTip()" title="点击查看更新说明" style="cursor:pointer">
-        <span class="muted">版本</span><span id="verInfo">v1.2.2</span>
+        <span class="muted">版本</span><span id="verInfo">v1.2.3</span>
       </div>
       <div class="meta-row"><span class="muted">作者</span><span>po9873</span></div>
     </div>
