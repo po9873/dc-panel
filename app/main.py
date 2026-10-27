@@ -8,6 +8,7 @@ import os
 import secrets
 import asyncio
 import urllib.parse
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -508,7 +509,7 @@ async def status(request: Request):
 # ---------- 面板自身更新检测（Docker Hub） ----------
 
 HUB_REPO = os.environ.get("PANEL_HUB_REPO", "<dockerhub-user>/dc-panel")
-APP_VERSION = "v1.2.4"
+APP_VERSION = "v1.2.5"
 
 def _boot_time():
     try:
@@ -814,6 +815,19 @@ async def _scan_device_updates(device: dict, containers: list, client, cfg: dict
         if not has_update:
             pending.pop(key, None)
             continue
+        # 面板自身容器：更新自己必然中断自身、进度丢失并被误判失败，
+        # 跳过且不推送失败通知，避免「一直报错推送」的死循环。
+        if _is_self_container(c):
+            if not pending.get(key, {}).get("self_skipped"):
+                pending.setdefault(key, {})["self_skipped"] = True
+                record = {
+                    "id": secrets.token_hex(6), "time": _record_time(), "device": device["name"],
+                    "container": name, "image": _image_name(c), "status": "已跳过",
+                    "source": "自动更新" if auto else "定时检查",
+                    "message": "面板自身容器，不能由面板更新（会中断自身并被误判失败）。请在宿主机执行：docker compose pull && docker compose up -d",
+                }
+                _add_history(record)
+            continue
         # 空选择表示该设备不启用这一类任务；有选择时只处理勾选项。
         if not selected or name not in selected:
             continue
@@ -886,6 +900,57 @@ async def _scan_device_updates(device: dict, containers: list, client, cfg: dict
 
 
 # ---------- 更新 ----------
+
+def _self_container_id() -> str:
+    """容器内运行时读取自身容器 ID，用于识别「面板自己」。
+
+    Docker 容器里 /proc/self/cgroup 形如 `0::/docker/<64位id>`（cgroup v2）、
+    `12:pids:/docker/<id>`（v1），systemd 驱动下还有 `docker-<id>.scope`。
+    读不到就返回空（非容器环境或权限受限），退化为按容器名/镜像名匹配。
+    """
+    for path in ("/proc/self/cgroup", "/proc/1/cgroup"):
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                txt = f.read()
+        except Exception:
+            continue
+        m = re.search(r"[0-9a-f]{64}", txt)
+        if m:
+            return m.group(0)
+        m = re.search(r"docker[_-]([0-9a-f]{12,64})", txt)
+        if m:
+            return m.group(1)
+    return ""
+
+
+# 面板自身容器的识别提示：优先用部署时设置的环境变量，默认 "dc-panel"
+PANEL_SELF_HINT = (os.environ.get("PANEL_CONTAINER_NAME") or "dc-panel").strip().lower()
+
+
+def _is_self_container(c: dict) -> bool:
+    """判断这个容器是不是面板自己。
+
+    面板更新自己必然失败：DockerCopilot 更新容器的第一步就是停掉目标容器，
+    面板一停就没有进程接手，进度追踪立刻中断，重启后只能判失败；下一轮又扫到
+    haveUpdate 再提交——形成「一直报错推送」的死循环。这里识别出来直接跳过。
+    """
+    try:
+        cid = str(c.get("id") or "").strip().lower()
+        name = str(c.get("name") or "").strip().lower()
+        image = str(c.get("image") or c.get("usingImage")
+                    or c.get("createImage") or "").lower()
+        self_id = _self_container_id().lower()
+        if self_id and cid and (
+                self_id.startswith(cid[:12]) or cid.startswith(self_id[:12])):
+            return True
+        if name and PANEL_SELF_HINT and PANEL_SELF_HINT in name:
+            return True
+        if image and PANEL_SELF_HINT and PANEL_SELF_HINT in image:
+            return True
+    except Exception:
+        pass
+    return False
+
 
 def _ok_code(code) -> bool:
     """判断 DockerCopilot 返回的 code 是否为成功码。
@@ -1051,6 +1116,15 @@ async def update_containers(device_id: str, request: Request):
                 "status": "进行中",
             }
             _add_history(record)
+            # 面板自身容器：更新自己会先停掉自己，必然中断并被误判失败
+            if _is_self_container(c):
+                record["status"] = "已跳过"
+                record["message"] = ("面板自身容器，不能由面板更新（会中断自身并被误判失败）。"
+                                     "请在宿主机执行：docker compose pull && docker compose up -d")
+                _refresh_history(record)
+                results.append({"id": cid, "name": record["container"],
+                                "ok": False, "error": record["message"]})
+                continue
             try:
                 payload, task_id = await dc_update(client, device, c)
                 record["message"] = str(payload.get("msg") or payload.get("message") or "更新任务已创建")
