@@ -253,7 +253,7 @@ async def dc_update(client, device: dict, container: dict):
     payload = r.json() if r.content else {}
     if isinstance(payload, dict):
         code = payload.get("code")
-        if code not in (None, 0, 200):
+        if not _ok_code(code):
             raise HTTPException(502, f"DC [{device['name']}] 更新失败：{payload.get('msg') or payload.get('message') or code}")
         if payload.get("success") is False:
             raise HTTPException(502, f"DC [{device['name']}] 更新失败：{payload.get('msg') or payload.get('message') or '接口返回失败'}")
@@ -508,7 +508,7 @@ async def status(request: Request):
 # ---------- 面板自身更新检测（Docker Hub） ----------
 
 HUB_REPO = os.environ.get("PANEL_HUB_REPO", "<dockerhub-user>/dc-panel")
-APP_VERSION = "v1.2.3"
+APP_VERSION = "v1.2.4"
 
 def _boot_time():
     try:
@@ -887,6 +887,22 @@ async def _scan_device_updates(device: dict, containers: list, client, cfg: dict
 
 # ---------- 更新 ----------
 
+def _ok_code(code) -> bool:
+    """判断 DockerCopilot 返回的 code 是否为成功码。
+
+    DC 各版本约定不一致：有的用 200、有的用 0、有的干脆不返回 code，
+    还有版本把数字序列化成字符串（"200"/"0"）。直接拿字面量比较会把字符串
+    "200" 当成失败，进而把明明已创建的更新任务报错推给客户。这里统一归一化。
+    """
+    if code is None:
+        # 不返回 code 的老版本按 HTTP 状态码表达结果，视为成功
+        return True
+    try:
+        return int(code) in (0, 200, 201, 202)
+    except (TypeError, ValueError):
+        return False
+
+
 async def _confirm_container_updated(client, device: dict, container_name: str):
     """DC 自更新会重启自身，内存里的进度记录随之丢失，/api/progress 报
     "taskID 未找到"。此时回查容器列表：haveUpdate 消失即更新已完成。
@@ -928,7 +944,7 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
                 # DC 的进度记录在内存中：更新 dockercopilot 自身会导致 DC 重启、
                 # 进度记录被清空，/api/progress 返回 400 "taskID 未找到"。
                 # 这不是更新失败——回查容器状态确认真实结果，避免误报。
-                task_lost = code not in (None, 0, 200) and (
+                task_lost = (not _ok_code(code)) and (
                     "未找到" in msg or "not found" in msg.lower())
                 if task_lost:
                     confirmed = await _confirm_container_updated(client, device, record.get("container", ""))
@@ -957,13 +973,18 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
                 is_done = _is_true(detail.get("isDone", p.get("isDone")))
                 is_failed = _is_true(detail.get("failed", p.get("failed")))
                 is_canceled = _is_true(detail.get("canceled", p.get("canceled")))
+                # 终态信号：DC 明确给出完成/失败/取消，或 status 有值
+                terminal = is_done or is_failed or is_canceled or bool(status)
                 success = (is_done and not is_failed and not is_canceled) \
                     or status in ("completed", "complete", "success", "done") \
-                    or (code == 200 and any(x in msg.lower() for x in ("成功", "success", "完成", "completed")))
+                    or (_ok_code(code) and any(x in msg.lower() for x in ("成功", "success", "完成", "completed")))
+                # 失败只在明确终态时判定：拉取镜像过程中 progress message 常出现
+                # 「失败/错误/error」（某一层拉取重试的字样），据此判失败会不停给客户
+                # 推送「拉取失败」的误报。字符串匹配仅在已到终态时才作为收尾依据。
                 failed = is_failed or is_canceled \
                     or status in ("failed", "failure", "error", "canceled", "cancelled") \
-                    or (code not in (None, 0, 200) and bool(msg)) \
-                    or any(x in msg.lower() for x in ("失败", "错误", "failed", "error", "取消", "canceled"))
+                    or (not _ok_code(code)) \
+                    or (terminal and any(x in msg.lower() for x in ("失败", "错误", "failed", "error", "取消", "canceled")))
                 if cfg.get("schedule_report") and not (success or failed):
                     await notify_update({**record, "status": "进度", "message": msg})
                 if success:
