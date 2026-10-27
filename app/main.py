@@ -96,6 +96,10 @@ AUTOMATION_DEFAULTS = {
     # 改后下一次循环（≤20 秒）即按新间隔生效，无需重启。
     "self_check_interval": 5,
     "self_update_notify": True,
+    # 是否允许面板更新自身容器：默认关闭，避免「停掉自己→进程死→误判失败→
+    # 重启又扫到→再提交」的推送死循环。打开后由 DockerCopilot（独立进程）代为
+    # 停旧建新，面板重启后 startup 会回查真实结果并补发通知。
+    "allow_self_update": False,
 }
 AUTOMATION_TASK = None
 AUTOMATION_LAST_RUN = {"update": "", "auto": ""}
@@ -865,7 +869,8 @@ async def _scan_device_updates(device: dict, containers: list, client, cfg: dict
             continue
         # 面板自身容器：更新自己必然中断自身、进度丢失并被误判失败，
         # 跳过且不推送失败通知，避免「一直报错推送」的死循环。
-        if _is_self_container(c):
+        # 仅当用户在「自动化」设置里打开「允许面板更新自身」时才放行。
+        if _is_self_container(c) and not _config().get("allow_self_update"):
             if not pending.get(key, {}).get("self_skipped"):
                 pending.setdefault(key, {})["self_skipped"] = True
                 record = {
@@ -1305,8 +1310,9 @@ async def update_containers(device_id: str, request: Request):
                 "status": "进行中",
             }
             _add_history(record)
-            # 面板自身容器：更新自己会先停掉自己，必然中断并被误判失败
-            if _is_self_container(c):
+            # 面板自身容器：更新自己会先停掉自己，必然中断并被误判失败。
+            # 未开启「允许面板更新自身」时直接跳过，避免误判失败死循环。
+            if _is_self_container(c) and not _config().get("allow_self_update"):
                 record["status"] = "已跳过"
                 record["message"] = ("面板自身容器，不能由面板更新（会中断自身并被误判失败）。"
                                      "请在宿主机执行：docker compose pull && docker compose up -d")
@@ -1359,7 +1365,7 @@ async def set_automation(request: Request):
         if k in incoming:
             cfg[k] = incoming[k]
     cfg["enabled"] = bool(cfg.get("enabled"))
-    for key in ("update_notify", "auto_update_notify", "auto_update_success", "schedule_report", "delete_images", "self_update_notify"):
+    for key in ("update_notify", "auto_update_notify", "auto_update_success", "schedule_report", "delete_images", "self_update_notify", "allow_self_update"):
         cfg[key] = bool(cfg.get(key))
     cfg["interval"] = max(1, int(cfg.get("interval") or 10))
     cfg["interval_limit"] = max(1, int(cfg.get("interval_limit") or 6))
@@ -1386,6 +1392,9 @@ async def set_automation(request: Request):
         }
     data = _config()
     data["automation"] = cfg
+    # allow_self_update 是面板级开关（拦截逻辑读顶层配置），与 automation 子配置
+    # 分开存，避免只在 automation 子项里、而拦截处读不到导致开关失效。
+    data["allow_self_update"] = bool(cfg.get("allow_self_update"))
     data["automation_devices"] = devices
     _save_config(data)
     return {"ok": True, "config": cfg, "devices": devices}
@@ -1900,11 +1909,13 @@ async def notify_update(record: dict):
     if _notify_dup(dedupe_key, str(record.get("status") or "")):
         print(f"[notify] 去重跳过：{dedupe_key} status={record.get('status')}", flush=True)
         return
-    # 兜底硬闸：不管从哪条路径进来，面板自身的容器一律不推「失败」。
-    # 面板更新自己必然先把自己停掉，进度永远读不到，任何「失败」都是误报，
-    # 而且会每轮反复推送。这里在推送出口再挡一次，避免上游漏判。
-    if str(record.get("status") or "") == "失败" and _is_self_name(
-            str(record.get("container") or ""), str(record.get("image") or "")):
+    # 兜底硬闸：默认情况下（未开启「允许面板更新自身」），面板自身的容器
+    # 一律不推「失败」——面板更新自己必然先把自己停掉，进度永远读不到，
+    # 任何「失败」都是误报，而且会每轮反复推送。这里在推送出口再挡一次，
+    # 避免上游漏判。一旦用户主动开启自更新，则放行真实失败以便排查。
+    if (str(record.get("status") or "") == "失败" and _is_self_name(
+            str(record.get("container") or ""), str(record.get("image") or ""))
+            and not _config().get("allow_self_update")):
         record["status"] = "已跳过"
         record["message"] = ("面板自身容器不能由面板更新（会中断自身并被误判失败）。"
                              "请在宿主机执行：docker compose pull && docker compose up -d")

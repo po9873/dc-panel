@@ -939,6 +939,7 @@ function renderAutomation(){
     <label style="width:110px">最多轮询次数<input id="auto-limit" type="number" min="1" value="${Number(c.interval_limit||6)}"></label>
     <label style="width:170px">面板自检间隔（分钟）<input id="auto-self-interval" type="number" min="1" value="${Number(c.self_check_interval||5)}"></label>
     <label class="nt-enable"><input id="auto-self-notify" type="checkbox" ${c.self_update_notify?'checked':''}>发现新版本时通知</label>
+    <label class="nt-enable" title="开启后，面板发现自身有新版本会直接交给 DockerCopilot 更新自己（期间面板会重启约 10~60 秒）。关闭则保持「已跳过」，需手动 docker compose pull && docker compose up -d"><input id="auto-self-update" type="checkbox" ${c.allow_self_update?'checked':''}>允许面板更新自身</label>
   </div>`;
   const db=$('autoDevices');if(!db)return;
   db.innerHTML=(autoData.devices||[]).map(d=>{
@@ -954,7 +955,7 @@ function setAutomationGroup(did,cls,on){
   document.querySelectorAll('.'+cls+'[data-did="'+CSS.escape(String(did))+'"]').forEach(x=>x.checked=!!on);
 }
 function collectAutomation(){
-  const c={enabled:$('auto-enabled')?.checked,update_cron:$('auto-update-cron')?.value.trim()||'',update_notify:$('auto-notify')?.checked,auto_update_cron:$('auto-auto-cron')?.value.trim()||'',auto_update_notify:$('auto-auto-notify')?.checked,auto_update_success:$('auto-success')?.checked,schedule_report:$('auto-report')?.checked,delete_images:$('auto-delete')?.checked,interval:Number($('auto-interval')?.value||10),interval_limit:Number($('auto-limit')?.value||6),self_check_interval:Number($('auto-self-interval')?.value||5),self_update_notify:$('auto-self-notify')?.checked};
+  const c={enabled:$('auto-enabled')?.checked,update_cron:$('auto-update-cron')?.value.trim()||'',update_notify:$('auto-notify')?.checked,auto_update_cron:$('auto-auto-cron')?.value.trim()||'',auto_update_notify:$('auto-auto-notify')?.checked,auto_update_success:$('auto-success')?.checked,schedule_report:$('auto-report')?.checked,delete_images:$('auto-delete')?.checked,interval:Number($('auto-interval')?.value||10),interval_limit:Number($('auto-limit')?.value||6),self_check_interval:Number($('auto-self-interval')?.value||5),self_update_notify:$('auto-self-notify')?.checked,allow_self_update:$('auto-self-update')?.checked};
   const ds={};
   document.querySelectorAll('.au-upd:checked').forEach(x=>(ds[x.dataset.did]??={update:[],auto_update:[]}).update.push(x.value));
   document.querySelectorAll('.au-auto:checked').forEach(x=>(ds[x.dataset.did]??={update:[],auto_update:[]}).auto_update.push(x.value));
