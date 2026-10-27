@@ -28,6 +28,10 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 app = FastAPI(title="DC Panel", docs_url=None, redoc_url=None)
 serializer: URLSafeTimedSerializer = None  # type: ignore
 
+# 仓库根目录（app/ 的上级）。静态资源一律用绝对路径，避免依赖启动时的 cwd，
+# 否则从 app/ 目录直接起服务时 static/index.html 会解析到不存在的路径而 500。
+BASE_DIR = Path(__file__).resolve().parent.parent
+
 
 def _load(path: Path, default):
     try:
@@ -393,14 +397,14 @@ async def shutdown():
 
 @app.get("/")
 async def index():
-    return FileResponse("static/index.html", headers={"Cache-Control": "no-store, must-revalidate"})
+    return FileResponse(BASE_DIR / "static" / "index.html", headers={"Cache-Control": "no-store, must-revalidate"})
 
 
 @app.get("/sw.js", include_in_schema=False)
 async def service_worker():
     """Service Worker 脚本：必须可访问且带正确的 Content-Type / Scope"""
     return FileResponse(
-        "static/sw.js",
+        BASE_DIR / "static" / "sw.js",
         media_type="application/javascript",
         headers={"Cache-Control": "no-store", "Service-Worker-Allowed": "/"},
     )
@@ -409,7 +413,7 @@ async def service_worker():
 @app.get("/manifest.json", include_in_schema=False)
 async def pwa_manifest():
     """PWA 清单（主屏图标、启动画面）"""
-    return FileResponse("static/manifest.json",
+    return FileResponse(BASE_DIR / "static" / "manifest.json",
                         media_type="application/manifest+json",
                         headers={"Cache-Control": "no-cache"})
 
@@ -420,7 +424,7 @@ async def static_asset(fname: str):
     import re
     if not re.fullmatch(r"[A-Za-z0-9._-]+", fname) or ".." in fname:
         raise HTTPException(404, "not found")
-    p = Path("static") / fname
+    p = BASE_DIR / "static" / fname
     if not p.is_file():
         raise HTTPException(404, "not found")
     ext = p.suffix.lstrip(".").lower()
