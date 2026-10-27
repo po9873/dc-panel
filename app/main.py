@@ -1069,7 +1069,63 @@ def _is_terminal_status(status: str) -> bool:
     return s in _STATUS_DONE or s in _STATUS_BAD
 
 
-async def _confirm_container_updated(client, device: dict, container_name: str):
+def _record_dt(record) -> "datetime | None":
+    """记录的提交时间（"YYYY-MM-DD HH:MM:SS"，东八区）；解析失败返回 None。"""
+    try:
+        return datetime.strptime(str(record.get("time") or ""),
+                                 "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone(timedelta(hours=8)))
+    except ValueError:
+        return None
+
+
+def _parse_dt_loose(v):
+    """宽容解析容器创建时间：epoch 秒/毫秒、ISO 字符串、"YYYY-MM-DD HH:MM:SS"。"""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        ts = float(v)
+        if ts > 1e12:  # 毫秒时间戳
+            ts /= 1000.0
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except Exception:
+            return None
+    s = str(v).strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return _parse_dt_loose(int(s))
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.replace(tzinfo=timezone(timedelta(hours=8))) if dt.tzinfo is None else dt
+    except Exception:
+        pass
+    try:
+        return datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone(timedelta(hours=8)))
+    except Exception:
+        return None
+
+
+_CREATED_KEYS = ("created", "createdAt", "Created", "create_time", "createTime")
+
+
+def _container_rebuilt_after(c: dict, submitted) -> bool:
+    """容器创建时间晚于更新提交时间 = 提交后容器被重建过，新镜像必然已跑起来。"""
+    if submitted is None:
+        return False
+    for k in _CREATED_KEYS:
+        dt = _parse_dt_loose(c.get(k))
+        if dt is not None:
+            return dt > submitted
+    return False
+
+
+async def _confirm_container_updated(client, device: dict, container_name: str,
+                                     submitted=None):
     """DC 自更新会重启自身，内存里的进度记录随之丢失，/api/progress 报
     "taskID 未找到"。此时回查容器列表：haveUpdate 消失即更新已完成。
     返回 True=已完成 / False=仍标记可更新 / None=暂无法确认。"""
@@ -1085,7 +1141,13 @@ async def _confirm_container_updated(client, device: dict, container_name: str):
         cid = str(c.get("id") or "").strip()
         if target and (nm == target or (cid and (cid == target or cid.startswith(target[:12])
                                                  or target.startswith(cid[:12])))):
-            return not _is_true(c.get("haveUpdate"))
+            if not _is_true(c.get("haveUpdate")):
+                return True
+            # haveUpdate 有缓存滞后：DC 不一定立刻刷新镜像摘要，刚更新完的容器
+            # 可能仍被标成「可更新」。此时看硬信号——容器创建时间晚于提交时间，
+            # 说明 DC 已经用新镜像重建过它，直接确认成功，让成功通知马上到，
+            # 不空等 DC 缓存过期。该信号只用来确认成功，绝不用于判失败。
+            return _container_rebuilt_after(c, submitted)
     return None
 
 
@@ -1106,6 +1168,10 @@ async def _confirm_watch(device: dict, record: dict, cfg: dict):
     deadline = time.time() + int(cfg.get("confirm_minutes") or 45) * 60
     step = max(20, int(cfg.get("confirm_interval") or 60))
     last_confirmed = None
+    # 前 2 分钟用 15 秒一查的快节奏：镜像拉完、容器重建往往就发生在这几分钟里，
+    # 成功通知要「马上到」，不能等用户设置的长间隔（默认 60 秒）慢慢磨。
+    # 快节奏过后仍未确认的，再放慢到 confirm_interval 省请求。
+    fast_until = time.time() + 120
     # 面板自更新会重启自身：本进程的启动时间晚于该记录的提交时间，就说明面板
     # 已经带着新镜像重启成功。DC 的镜像摘要缓存常有滞后，重启后仍把 dc-panel
     # 标成「可更新」，等满确认期只会误判失败——这里直接确认成功，不再空等。
@@ -1130,12 +1196,13 @@ async def _confirm_watch(device: dict, record: dict, cfg: dict):
     try:
         async with httpx.AsyncClient() as client:
             while time.time() < deadline:
-                await asyncio.sleep(step)
+                await asyncio.sleep(15 if time.time() < fast_until else step)
                 if rid in DELETED_HISTORY_IDS:
                     return
                 try:
                     confirmed = await _confirm_container_updated(
-                        client, device, record.get("container", ""))
+                        client, device, record.get("container", ""),
+                        submitted=_record_dt(record))
                 except Exception:
                     confirmed = None
                 if confirmed is not None:
@@ -1225,7 +1292,9 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
                 explicit_fail = is_failed or is_canceled or status in _STATUS_BAD
                 if not _ok_code(code) and not explicit_fail:
                     record["progress"] = f"进度不可读（code={code}），正在核对容器状态…"
-                    confirmed = await _confirm_container_updated(client, device, record.get("container", ""))
+                    confirmed = await _confirm_container_updated(
+                        client, device, record.get("container", ""),
+                        submitted=_record_dt(record))
                     if confirmed is True:
                         record["status"] = "成功"
                         record["message"] = "更新已完成（进度记录不可读，经容器状态确认）"
@@ -1281,7 +1350,8 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
             try:
                 async with httpx.AsyncClient() as client:
                     confirmed = await _confirm_container_updated(
-                        client, device, record.get("container", ""))
+                        client, device, record.get("container", ""),
+                        submitted=_record_dt(record))
             except Exception:
                 confirmed = None
             record.pop("progress", None)
