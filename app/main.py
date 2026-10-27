@@ -395,6 +395,8 @@ async def shutdown():
         except asyncio.CancelledError:
             pass
         AUTOMATION_TASK = None
+    # 面板自身被更新时会先停机，聚合队列里可能还压着结果，退出前先冲出去。
+    await flush_pending_notifications()
 
 
 # ---------- 页面 ----------
@@ -856,6 +858,9 @@ async def _scan_device_updates(device: dict, containers: list, client, cfg: dict
     selections = _automation_devices().get(device.get("id"), {})
     selected_key = "auto_update" if auto else "update"
     selected = selections.get(selected_key) or []
+    # 已勾进「自动更新」且配了自动更新定时的容器，由自动更新分支推「已触发/成功」，
+    # 定时检查再推一条「可更新」属于重复通知，这里直接跳过。
+    auto_sel = selections.get("auto_update") or []
     seen = set()
     for c in containers:
         name = str(c.get("name") or c.get("id") or "").strip()
@@ -939,6 +944,8 @@ async def _scan_device_updates(device: dict, containers: list, client, cfg: dict
                         await notify_update(record)
         else:
             if pending.get(key, {}).get("notify_fingerprint") == fingerprint:
+                continue
+            if cfg.get("auto_update_cron") and name in auto_sel:
                 continue
             pending.setdefault(key, {})["notify_fingerprint"] = fingerprint
             pending[key].update({"image": image, "time": _record_time()})
@@ -1099,6 +1106,27 @@ async def _confirm_watch(device: dict, record: dict, cfg: dict):
     deadline = time.time() + int(cfg.get("confirm_minutes") or 45) * 60
     step = max(20, int(cfg.get("confirm_interval") or 60))
     last_confirmed = None
+    # 面板自更新会重启自身：本进程的启动时间晚于该记录的提交时间，就说明面板
+    # 已经带着新镜像重启成功。DC 的镜像摘要缓存常有滞后，重启后仍把 dc-panel
+    # 标成「可更新」，等满确认期只会误判失败——这里直接确认成功，不再空等。
+    if _is_self_name(str(record.get("container") or ""), str(record.get("image") or "")):
+        try:
+            rt = datetime.strptime(str(record.get("time") or ""),
+                                   "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone(timedelta(hours=8)))
+            if _boot_time() > rt:
+                record["status"] = "成功"
+                record["message"] = "面板已带新镜像重启完成（经启动时间确认）"
+                record.pop("progress", None)
+                _refresh_history(record); await _sync_out(record)
+                if cfg.get("auto_update_success", True):
+                    try:
+                        await notify_update(record)
+                    except Exception:
+                        pass
+                return
+        except ValueError:
+            pass
     try:
         async with httpx.AsyncClient() as client:
             while time.time() < deadline:
@@ -1151,6 +1179,8 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
     cfg = automation_cfg or {}
     final_notified = False
     still_pending_hits = 0
+    prog_last_pct = -1
+    prog_last_ts = 0.0
     try:
         async with httpx.AsyncClient() as client:
             for _ in range(max(1, int(cfg.get("interval_limit") or 6))):
@@ -1214,7 +1244,19 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
                     _refresh_history(record)
                     continue
                 if cfg.get("schedule_report") and not (success or failed):
-                    await notify_update({**record, "status": "进度", "message": msg})
+                    pct = _progress_pct(record.get("progress"))
+                    now_ts = time.time()
+                    # 进度只在「跨过 20% 台阶」或「久未推送」时发一条：默认 10 秒一轮
+                    # 轮询、20 轮下来，每个容器逐条推要刷十几条，手机端直接刷屏。
+                    if pct < 0:
+                        should_push = now_ts - prog_last_ts >= 120
+                    else:
+                        should_push = pct >= prog_last_pct + 20 or now_ts - prog_last_ts >= 180
+                    if should_push:
+                        if pct >= 0:
+                            prog_last_pct = pct
+                        prog_last_ts = now_ts
+                        await notify_update({**record, "status": "进度", "message": msg})
                 if success:
                     record["status"] = "成功"
                     record["message"] = detail_msg or msg or "容器更新成功"
@@ -1247,13 +1289,17 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
                 record["status"] = "成功"
                 record["message"] = "更新已完成（轮询未拿到终态，经容器状态确认）"
                 await _sync_out(record)
-            elif confirmed is False and still_pending_hits:
-                record["status"] = "失败"
-                record["message"] = "轮询结束且容器仍标记为可更新，DockerCopilot 未实际完成更新"
-                await _sync_out(record)
             else:
+                # 「仍标记为可更新」不等于失败：拉镜像常要几分钟，轮询窗口（约 1~3
+                # 分钟）结束时多半还在拉取/重建，此时 DC 的 haveUpdate 自然还在。
+                # 这里曾直接判「失败」并推送，造成大量误报失败；且记录一旦终态就
+                # 不会再补成功通知。改为交给 _confirm_watch 持续确认，由它给出
+                # 最终的成功/失败（成功必通知，失败要等满确认期才判，绝不抢跑）。
                 record["status"] = "未确认"
-                record["message"] = "轮询结束，进度接口无明确终态且无法读取容器状态，正在继续确认…"
+                if confirmed is False and still_pending_hits:
+                    record["message"] = "轮询窗口结束时镜像仍在拉取/重建中，已转入后台持续确认…"
+                else:
+                    record["message"] = "轮询结束，进度接口无明确终态且无法读取容器状态，正在继续确认…"
                 await _sync_out(record)
             _refresh_history(record)
             # 关键：不要就此停下。拉大镜像往往超过轮询窗口，这里继续后台回查
@@ -1901,8 +1947,118 @@ def _notify_dup(key: str, status: str) -> bool:
     return False
 
 
+# ---------- 通知聚合（同类结果合并成一条） ----------
+# 一轮扫描会为每个容器各产生一条结果（可更新 / 已触发 / 成功 / 失败）。容器多的
+# 设备一轮就是几十条，逐条推送会在手机 WebPush 和企业微信机器人里堆成「一堆提示」。
+# 这里把短窗口内的通知收集起来合并成一条汇总再发；窗口内只有一条时，仍按用户的
+# 自定义模板渲染，行为与以前保持一致。
+NOTIFY_BATCH_WINDOW = max(1.0, float(os.environ.get("PANEL_NOTIFY_BATCH_WINDOW") or 8))
+NOTIFY_BATCH_MAX_LINES = 15
+NOTIFY_BATCH_MAX_CHARS = 1600
+_NOTIFY_QUEUE: list = []
+_NOTIFY_FLUSH_TASK = None
+
+_STATUS_ICON = {
+    "成功": "✅", "失败": "❌", "可更新": "🔔", "已触发": "🚀",
+    "进度": "⏳", "已跳过": "⏭️", "未确认": "❓", "等待中": "⌛",
+}
+
+
+def _progress_pct(text) -> int:
+    """从进度文案里取百分比（取不到返回 -1）。"""
+    m = re.search(r"(\d{1,3})\s*%", str(text or ""))
+    if not m:
+        return -1
+    try:
+        return max(0, min(100, int(m.group(1))))
+    except ValueError:
+        return -1
+
+
+def _notify_enqueue(record: dict):
+    """把一条通知放进聚合队列，由后台任务按窗口合并后统一推送。"""
+    _NOTIFY_QUEUE.append(record)
+    global _NOTIFY_FLUSH_TASK
+    try:
+        if _NOTIFY_FLUSH_TASK is None or _NOTIFY_FLUSH_TASK.done():
+            _NOTIFY_FLUSH_TASK = asyncio.get_event_loop().create_task(_notify_flush_loop())
+    except RuntimeError:
+        # 没有运行中的事件循环（如单测直接调用）时直接同步发出去
+        _NOTIFY_QUEUE.pop()
+
+
+async def _notify_flush_loop():
+    while True:
+        await asyncio.sleep(NOTIFY_BATCH_WINDOW)
+        try:
+            await _notify_flush()
+        except Exception as e:
+            print(f"[notify] 汇总推送失败: {e}", flush=True)
+
+
+async def _notify_flush():
+    """把队列里累积的通知合并后推送一次。"""
+    if not _NOTIFY_QUEUE:
+        return
+    records = _NOTIFY_QUEUE[:]
+    _NOTIFY_QUEUE.clear()
+    text = _render_text(records[0]) if len(records) == 1 else _render_batch(records)
+    await _notify_send(text)
+
+
+def _render_batch(records: list) -> str:
+    """多条结果合并成一条汇总（按设备分组，超行数/字符数自动截断）。"""
+    by_dev: dict = {}
+    for r in records:
+        by_dev.setdefault(str(r.get("device") or "未知设备"), []).append(r)
+    lines = [f"【DC Panel】{len(records)} 条更新动态"]
+    shown = 0
+    for dev, recs in by_dev.items():
+        lines.append(f"—— {dev}（{len(recs)} 条）")
+        for r in recs:
+            if shown >= NOTIFY_BATCH_MAX_LINES:
+                break
+            status = str(r.get("status") or "")
+            line = f"{_STATUS_ICON.get(status, '•')} {r.get('container', '')} · {status}"
+            extra = str(r.get("message") or "").strip().replace("\n", " ")
+            if extra:
+                line += f"｜{extra[:32]}"
+            lines.append(line)
+            shown += 1
+        if shown >= NOTIFY_BATCH_MAX_LINES:
+            break
+    rest = len(records) - shown
+    if rest > 0:
+        lines.append(f"…另有 {rest} 条，详见面板「更新历史」")
+    text = "\n".join(lines)
+    if len(text) > NOTIFY_BATCH_MAX_CHARS:
+        text = text[:NOTIFY_BATCH_MAX_CHARS - 18] + "\n…（内容过长已截断）"
+    return text
+
+
+async def _notify_send(text: str):
+    """按已启用的通道推送一段文本（含手机 WebPush）。"""
+    notify = _config().get("notify") or {}
+    loop = asyncio.get_event_loop()
+    for cid, item in CHANNEL_MAP.items():
+        c = notify.get(cid) or {}
+        if not c.get("enabled"):
+            continue
+        loop.create_task(_safe_notify(item[1], _dispatch(cid, text)))
+    if _push_subs():
+        loop.create_task(_safe_notify("Web Push", push_webpush_all(text)))
+
+
+async def flush_pending_notifications():
+    """退出前把队列里还没发出去的通知冲掉，避免丢结果。"""
+    try:
+        await _notify_flush()
+    except Exception:
+        pass
+
+
 async def notify_update(record: dict):
-    """更新完成后按已启用的通道推送（文本内容按自定义模板渲染）"""
+    """更新结果通知入口：去重 + 自身容器拦截 → 进入聚合队列统一推送。"""
     # 同一容器同一结果 30 分钟内只推一次：自动更新按分钟级调度，一旦某台设备
     # 持续处于同一状态就会被反复推送，形成「连续发一堆」。
     dedupe_key = f"{record.get('device', '')}::{record.get('container', '')}"
@@ -1921,16 +2077,7 @@ async def notify_update(record: dict):
                              "请在宿主机执行：docker compose pull && docker compose up -d")
         record.pop("progress", None)
         print(f"[notify] 已拦截面板自身容器的失败推送：{record.get('container')}", flush=True)
-    notify = _config().get("notify") or {}
-    text = _render_text(record)
-    loop = asyncio.get_event_loop()
-    for cid, item in CHANNEL_MAP.items():
-        c = notify.get(cid) or {}
-        if not c.get("enabled"):
-            continue
-        loop.create_task(_safe_notify(item[1], _dispatch(cid, text)))
-    if _push_subs():
-        loop.create_task(_safe_notify("Web Push", push_webpush_all(text)))
+    _notify_enqueue(record)
 
 
 async def _safe_notify(name: str, coro):
