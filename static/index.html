@@ -703,7 +703,7 @@ button.sm{font-size:13px;padding:4px 9px;border-radius:7px}
 
 <script>
 const COLORS=['#4f8cff','#3ddc84','#ffb74d','#ff6b6b','#b388ff','#4dd0e1','#f06292','#aed581'];
-let token=null,devices=[],curDev=null,containers=[],sel=new Set(),devCt={};
+let token=null,devices=[],curDev=null,containers=[],sel=new Set(),devCt={},ctPage=1;
 const $=id=>document.getElementById(id);
 async function api(path,opt={}){
   const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opt});
@@ -1215,16 +1215,10 @@ async function loadDevs(){
     <div class="u">${esc(d.url)}</div>
     <div class="st"><span class="badge ${d.online?'b-ok':'b-no'}">${d.online?'在线':'离线'}</span>${d.version?`<span class="badge b-info">v${esc(d.version)}</span>`:''}<span style="flex:1"></span><button class="danger del" onclick="delDev('${d.id}')">删除</button></div></div>`).join(''):'<div class="empty">还没有设备，在下方添加</div>';
   if(!devices.find(d=>d.id===curDev)&&devices[0])curDev=devices[0].id;
-  const n=devices.length;
-  // 不再用左右箭头在设备间翻页：所有设备一次性列出（每台机器一个分组）
-  $('devTabs').innerHTML=n?`<div class="dcpg" style="flex-wrap:wrap;gap:8px">
-    ${devices.map(d=>`<span class="pg" onclick="gotoDev('${d.id}')" title="定位到 ${esc(d.name)}">${esc(d.name)}</span>`).join('')}
-    <span style="color:var(--sub);font-size:14px">共 ${n} 台设备（下方按设备分组全部列出）</span>
-  </div>`:'<div class="empty">还没有设备，先在上方添加</div>';
-  if(!curDev&&devices[0])curDev=devices[0].id;
+  renderDevTabs();
   loadAllContainers();
 }
-function gotoDev(id){const el=document.getElementById('devsec-'+id);if(el)el.scrollIntoView({behavior:'smooth',block:'start'})}function pickDev(id){curDev=id;sel.clear();loadDevs()}
+function pickDev(id){curDev=id;sel.clear();ctPage=1;renderDevTabs();renderActiveDevice()}
 async function loadAllContainers(){
   $('ctTable').innerHTML='<tr><td class="empty">加载中…</td></tr>';
   try{
@@ -1234,29 +1228,40 @@ async function loadAllContainers(){
       catch(e){return [d.id,[]]}
     }));
     devCt={};res.forEach(([id,list])=>{devCt[id]=list});
-    renderAllContainers();
+    renderActiveDevice();
   }catch(e){$('ctTable').innerHTML=`<tr><td class="empty">${esc(e.message)}</td></tr>`}
 }
-function renderAllContainers(){
-  const devs=devices||[];
-  if(!devs.length){$('ctTable').innerHTML='<tr><td class="empty">还没有设备，先在上方添加</td></tr>';return}
+function renderDevTabs(){
+  const n=devices.length;
+  $('devTabs').innerHTML=n?`<div class="tabs">${
+    devices.map(d=>`<span class="tab ${d.id===curDev?'on':''}" onclick="pickDev('${d.id}')" title="${esc(d.online?'在线':'离线')}${d.version?' v'+esc(d.version):''}">${esc(d.name)}</span>`).join('')
+  }<span style="color:var(--sub);font-size:14px;align-self:center">共 ${n} 台设备（点上方标签切换，一机一页）</span></div>`
+  :'<div class="empty">还没有设备，先在上方添加</div>';
+}
+function renderActiveDevice(){
+  const d=devices.find(x=>x.id===curDev);
+  const tb=$('ctTable');
+  if(!d){tb.innerHTML='<tr><td class="empty">请选择上方的一台设备</td></tr>';return}
+  const list=devCt[d.id]||[];
+  const PAGE=10;
+  const totalPages=Math.max(1,Math.ceil(list.length/PAGE));
+  if(ctPage<1)ctPage=1;
+  if(ctPage>totalPages)ctPage=totalPages;
+  const start=(ctPage-1)*PAGE;
+  const pageList=list.slice(start,start+PAGE);
+  let selN=0;
   let html=`<tr><th style="width:34px"><input type="checkbox" onchange="selAll(this.checked?1:0)"></th><th>容器</th><th class="hide-m">镜像</th><th>状态</th><th></th></tr>`;
-  let all=0,selN=0;
-  devs.forEach(d=>{
-    const list=devCt[d.id]||[];
-    html+=`<tr id="devsec-${d.id}"><td colspan="5" style="background:var(--card2,rgba(127,127,127,.08))">
-      <div style="display:flex;align-items:center;gap:8px;padding:6px 2px;flex-wrap:wrap">
-        <b style="font-size:15px">${esc(d.name)}</b>
-        <span class="badge ${d.online?'b-ok':'b-no'}">${d.online?'在线':'离线'}</span>
-        ${d.version?`<span class="badge b-info">v${esc(d.version)}</span>`:''}
-        <span style="color:var(--sub);font-size:13px">${list.length} 个容器</span>
-      </div></td></tr>`;
-    if(!list.length){
-      html+=`<tr><td colspan="5" class="empty" style="padding-left:18px">${d.online?'该设备没有容器':'连不上该设备（检查地址/密钥）'}</td></tr>`;
-      return;
-    }
-    list.forEach(c=>{
-      all++;
+  html+=`<tr><td colspan="5" style="background:var(--card2,rgba(127,127,127,.08))">
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 2px;flex-wrap:wrap">
+      <b style="font-size:15px">${esc(d.name)}</b>
+      <span class="badge ${d.online?'b-ok':'b-no'}">${d.online?'在线':'离线'}</span>
+      ${d.version?`<span class="badge b-info">v${esc(d.version)}</span>`:''}
+      <span style="color:var(--sub);font-size:13px">${list.length} 个容器</span>
+    </div></td></tr>`;
+  if(!list.length){
+    html+=`<tr><td colspan="5" class="empty" style="padding-left:18px">${d.online?'该设备没有容器':'连不上该设备（检查地址/密钥）'}</td></tr>`;
+  }else{
+    pageList.forEach(c=>{
       const cid=c.id||c.name,nm=c.name||cid;
       const key=d.id+'::'+cid;
       if(sel.has(key))selN++;
@@ -1271,15 +1276,23 @@ function renderAllContainers(){
       <td><span class="badge ${running?'b-ok':'b-warn'}">${esc(c.status||c.state||'未知')}</span></td>
       <td><button class="ghost ${c.haveUpdate?'':'dim'}" onclick="doUpdateFor('${d.id}','${cid}')">更新</button></td></tr>`;
     });
-  });
-  html+=`<tr><td colspan="5" style="color:var(--sub);font-size:14px;padding-top:8px">共 ${all} 个容器，已选 ${selN} 个（按设备分组，全部列出）</td></tr>`;
-  $('ctTable').innerHTML=html;
+  }
+  html+=`<tr><td colspan="5" style="color:var(--sub);font-size:14px;padding-top:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <span>共 ${list.length} 个容器，已选 ${selN} 个（第 ${ctPage}/${totalPages} 页）</span>
+    <span style="flex:1"></span>
+    <button class="ghost sm" ${ctPage<=1?'disabled':''} onclick="ctPrev()">‹ 上一页</button>
+    <button class="ghost sm" ${ctPage>=totalPages?'disabled':''} onclick="ctNext()">下一页 ›</button>
+  </td></tr>`;
+  tb.innerHTML=html;
 }
+function ctPrev(){if(ctPage>1){ctPage--;renderActiveDevice()}}
+function ctNext(){ctPage++;renderActiveDevice()}
 function tog(id,on){on?sel.add(id):sel.delete(id)}
 function selAll(on){
-  sel=new Set();
-  if(on){(devices||[]).forEach(d=>{(devCt[d.id]||[]).forEach(c=>{sel.add(d.id+'::'+(c.id||c.name))})})}
-  renderAllContainers();
+  if(!curDev)return;
+  if(on){(devCt[curDev]||[]).forEach(c=>{sel.add(curDev+'::'+(c.id||c.name))})}
+  else{(devCt[curDev]||[]).forEach(c=>{sel.delete(curDev+'::'+(c.id||c.name))})}
+  renderActiveDevice();
 }
 async function addDev(){
   try{await api('/api/devices',{method:'POST',body:JSON.stringify({name:$('nName').value,url:$('nUrl').value,secretKey:$('nKey').value})});
