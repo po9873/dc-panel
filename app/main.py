@@ -245,6 +245,12 @@ async def dc_update(client, device: dict, container: dict):
     image = _image_name(container)
     if not name or not image:
         raise HTTPException(400, f"DC [{device['name']}] 缺少容器名或镜像名")
+    # 最后一道闸：任何入口都不要把「更新面板自己」的请求发给 DC。
+    # DC 更新容器的第一步是停掉目标容器，面板一停就没有进程接手，
+    # 之后必然读不到进度并被判失败，形成反复推送的死循环。
+    if _is_self_container(container) or _is_self_name(name, image):
+        raise HTTPException(409, "面板自身容器不允许由面板更新（会中断自身并被误判失败）。"
+                                 "请在宿主机执行：docker compose pull && docker compose up -d")
     r = await dc_request(
         client, device, "POST", f"/api/container/{urllib.parse.quote(cid, safe='')}/update",
         # DockerCopilot 当前更新接口按表单字段解析；发送 JSON 会返回
@@ -302,6 +308,9 @@ def _check_login(request: Request):
 
 @app.on_event("startup")
 async def startup():
+    print(f"[startup] DC Panel {APP_VERSION} | 自身容器识别提示: "
+          f"{sorted(h for h in PANEL_SELF_HINTS if h)} | 自身容器ID: "
+          f"{(_self_container_id() or '未读到')[:12]}", flush=True)
     global serializer
     cfg = _config()
     if "salt" not in cfg:
@@ -509,7 +518,7 @@ async def status(request: Request):
 # ---------- 面板自身更新检测（Docker Hub） ----------
 
 HUB_REPO = os.environ.get("PANEL_HUB_REPO", "<dockerhub-user>/dc-panel")
-APP_VERSION = "v1.2.6"
+APP_VERSION = "v1.2.7"
 
 def _boot_time():
     try:
@@ -875,6 +884,10 @@ async def _scan_device_updates(device: dict, containers: list, client, cfg: dict
                     record["status"] = "等待中"
                     record["message"] = "DockerCopilot 已有同资源任务，已延后到下次周期重试"
                     _refresh_history(record)
+                elif "面板自身容器" in message:
+                    record["status"] = "已跳过"
+                    record["message"] = message
+                    _refresh_history(record)
                 else:
                     record["status"] = "失败"; record["message"] = message; _refresh_history(record)
                     if cfg.get("auto_update_notify") or cfg.get("auto_update_success"):
@@ -923,8 +936,27 @@ def _self_container_id() -> str:
     return ""
 
 
-# 面板自身容器的识别提示：优先用部署时设置的环境变量，默认 "dc-panel"
-PANEL_SELF_HINT = (os.environ.get("PANEL_CONTAINER_NAME") or "dc-panel").strip().lower()
+# 面板自身容器的识别提示：内置 "dc-panel" 一定保留（用户设了 PANEL_CONTAINER_NAME
+# 也只是在此基础上追加，不会因为环境变量写错而失效），再兼容常见的自部署命名。
+PANEL_SELF_HINTS = {
+    "dc-panel",
+    (os.environ.get("PANEL_CONTAINER_NAME") or "").strip().lower(),
+    (os.environ.get("HOSTNAME") or "").strip().lower(),
+}
+PANEL_SELF_HINTS = {h for h in PANEL_SELF_HINTS if h}
+PANEL_SELF_HINT = "dc-panel"
+
+
+def _is_self_name(name: str = "", image: str = "") -> bool:
+    """只按容器名/镜像名判断是不是面板自己（不依赖 cgroup，读不到 ID 时也有效）。"""
+    nm = str(name or "").strip().lower()
+    img = str(image or "").strip().lower()
+    for hint in PANEL_SELF_HINTS:
+        if not hint:
+            continue
+        if hint in nm or hint in img:
+            return True
+    return False
 
 
 def _is_self_container(c: dict) -> bool:
@@ -943,9 +975,7 @@ def _is_self_container(c: dict) -> bool:
         if self_id and cid and (
                 self_id.startswith(cid[:12]) or cid.startswith(self_id[:12])):
             return True
-        if name and PANEL_SELF_HINT and PANEL_SELF_HINT in name:
-            return True
-        if image and PANEL_SELF_HINT and PANEL_SELF_HINT in image:
+        if _is_self_name(name, image):
             return True
     except Exception:
         pass
@@ -1593,8 +1623,39 @@ def _render_text(record: dict) -> str:
         return DEFAULT_TEMPLATE.format_map(_Safe(fields))
 
 
+# 通知去重：同一容器 + 同一状态在窗口内只推一次，避免自动更新每轮重复轰炸。
+# 状态发生变化（进行中 → 成功/失败/已跳过）时立即放行，不吞掉真正的状态流转。
+_NOTIFY_LAST: dict = {}
+_NOTIFY_DEDUPE_WINDOW = 30 * 60
+
+
+def _notify_dup(key: str, status: str) -> bool:
+    now = time.time()
+    prev = _NOTIFY_LAST.get(key)
+    if prev and prev[1] == status and now - prev[0] < _NOTIFY_DEDUPE_WINDOW:
+        return True
+    _NOTIFY_LAST[key] = (now, status)
+    return False
+
+
 async def notify_update(record: dict):
     """更新完成后按已启用的通道推送（文本内容按自定义模板渲染）"""
+    # 同一容器同一结果 30 分钟内只推一次：自动更新按分钟级调度，一旦某台设备
+    # 持续处于同一状态就会被反复推送，形成「连续发一堆」。
+    dedupe_key = f"{record.get('device', '')}::{record.get('container', '')}"
+    if _notify_dup(dedupe_key, str(record.get("status") or "")):
+        print(f"[notify] 去重跳过：{dedupe_key} status={record.get('status')}", flush=True)
+        return
+    # 兜底硬闸：不管从哪条路径进来，面板自身的容器一律不推「失败」。
+    # 面板更新自己必然先把自己停掉，进度永远读不到，任何「失败」都是误报，
+    # 而且会每轮反复推送。这里在推送出口再挡一次，避免上游漏判。
+    if str(record.get("status") or "") == "失败" and _is_self_name(
+            str(record.get("container") or ""), str(record.get("image") or "")):
+        record["status"] = "已跳过"
+        record["message"] = ("面板自身容器不能由面板更新（会中断自身并被误判失败）。"
+                             "请在宿主机执行：docker compose pull && docker compose up -d")
+        record.pop("progress", None)
+        print(f"[notify] 已拦截面板自身容器的失败推送：{record.get('container')}", flush=True)
     notify = _config().get("notify") or {}
     text = _render_text(record)
     loop = asyncio.get_event_loop()
