@@ -80,7 +80,14 @@ AUTOMATION_DEFAULTS = {
     "schedule_report": False,
     "delete_images": False,
     "interval": 10,
-    "interval_limit": 6,
+    # 轮询轮数：拉一个镜像常要几分钟，6 轮（约 1 分钟）根本看不到真进度，
+    # 默认放宽到 20 轮（约 3 分钟），窗口结束后还有 confirm_minutes 的持续确认兜底。
+    "interval_limit": 20,
+    # 轮询窗口结束后仍会继续回查容器真实状态的最长分钟数。
+    # 拉大镜像往往要好几分钟，窗口一结束就判定会让「其实拉完了」的更新永远
+    # 停在「待确认」，用户收不到成功通知。这里给一个兜底确认期。
+    "confirm_minutes": 45,
+    "confirm_interval": 60,
     # 面板自身新版本自检：独立于上面的定时检查开关，间隔分钟数可在设置里调，
     # 改后下一次循环（≤20 秒）即按新间隔生效，无需重启。
     "self_check_interval": 5,
@@ -101,6 +108,14 @@ def _automation_config() -> dict:
     except (TypeError, ValueError):
         out["self_check_interval"] = 5
     out["self_update_notify"] = bool(out.get("self_update_notify", True))
+    try:
+        out["confirm_minutes"] = max(1, min(240, int(out.get("confirm_minutes") or 45)))
+    except (TypeError, ValueError):
+        out["confirm_minutes"] = 45
+    try:
+        out["confirm_interval"] = max(20, int(out.get("confirm_interval") or 60))
+    except (TypeError, ValueError):
+        out["confirm_interval"] = 60
     return out
 
 
@@ -245,12 +260,15 @@ async def dc_update(client, device: dict, container: dict):
     image = _image_name(container)
     if not name or not image:
         raise HTTPException(400, f"DC [{device['name']}] 缺少容器名或镜像名")
-    # 最后一道闸：任何入口都不要把「更新面板自己」的请求发给 DC。
-    # DC 更新容器的第一步是停掉目标容器，面板一停就没有进程接手，
-    # 之后必然读不到进度并被判失败，形成反复推送的死循环。
-    if _is_self_container(container) or _is_self_name(name, image):
-        raise HTTPException(409, "面板自身容器不允许由面板更新（会中断自身并被误判失败）。"
-                                 "请在宿主机执行：docker compose pull && docker compose up -d")
+    # 自身容器默认不直接交给 DC 更新：DC 更新容器的第一步是停掉目标容器，
+    # 面板一停就没有进程接手，进度必然读不到、结果必然被判失败，形成反复推送。
+    # 但用户可以在设置里打开「允许面板更新自身」——打开后就正常提交，
+    # 并把记录落盘，面板重启后由 startup 续查真实结果并补发通知（不屏蔽、不丢进度）。
+    if (_is_self_container(container) or _is_self_name(name, image)) \
+            and not _config().get("allow_self_update"):
+        raise HTTPException(409, "面板自身容器默认不允许由面板更新（会中断自身并被误判失败）。"
+                                 "请在宿主机执行：docker compose pull && docker compose up -d，"
+                                 "或在设置里打开「允许面板更新自身」。")
     r = await dc_request(
         client, device, "POST", f"/api/container/{urllib.parse.quote(cid, safe='')}/update",
         # DockerCopilot 当前更新接口按表单字段解析；发送 JSON 会返回
@@ -311,6 +329,23 @@ async def startup():
     print(f"[startup] DC Panel {APP_VERSION} | 自身容器识别提示: "
           f"{sorted(h for h in PANEL_SELF_HINTS if h)} | 自身容器ID: "
           f"{(_self_container_id() or '未读到')[:12]}", flush=True)
+    # 面板自更新会把自己停掉：上一轮「进行中」的记录在新进程里续查真实结果。
+    # 这样就算中间被中断，用户也能看到最终是成功还是失败，而不是永远「待确认」。
+    try:
+        for rec in _history():
+            if str(rec.get("status") or "") not in ("进行中", "未确认", "等待中"):
+                continue
+            rid = str(rec.get("id") or "")
+            if not rid or rid in _PENDING_CONFIRM:
+                continue
+            dev = next((d for d in _devices() if d.get("name") == rec.get("device")), None)
+            if not dev:
+                continue
+            print(f"[startup] 续查未完成记录：{rec.get('device')}/{rec.get('container')}", flush=True)
+            _PENDING_CONFIRM[rid] = asyncio.create_task(
+                _confirm_watch(dev, rec, _automation_config()))
+    except Exception as e:
+        print(f"[startup] 续查失败: {e}", flush=True)
     global serializer
     cfg = _config()
     if "salt" not in cfg:
@@ -518,7 +553,7 @@ async def status(request: Request):
 # ---------- 面板自身更新检测（Docker Hub） ----------
 
 HUB_REPO = os.environ.get("PANEL_HUB_REPO", "<dockerhub-user>/dc-panel")
-APP_VERSION = "v1.2.7"
+APP_VERSION = "v1.3.0"
 
 def _boot_time():
     try:
@@ -883,13 +918,14 @@ async def _scan_device_updates(device: dict, containers: list, client, cfg: dict
                 if "已有任务在执行中" in message:
                     record["status"] = "等待中"
                     record["message"] = "DockerCopilot 已有同资源任务，已延后到下次周期重试"
-                    _refresh_history(record)
+                    _refresh_history(record); await _sync_out(record)
                 elif "面板自身容器" in message:
                     record["status"] = "已跳过"
                     record["message"] = message
-                    _refresh_history(record)
+                    _refresh_history(record); await _sync_out(record)
                 else:
                     record["status"] = "失败"; record["message"] = message; _refresh_history(record)
+                    await _sync_out(record)
                     if cfg.get("auto_update_notify") or cfg.get("auto_update_success"):
                         await notify_update(record)
         else:
@@ -1037,6 +1073,70 @@ async def _confirm_container_updated(client, device: dict, container_name: str):
     return None
 
 
+# 轮询窗口结束后仍在等待确认的记录：record_id -> asyncio.Task。
+# 防止面板重启前重复起确认任务，也让 UI 能看出「还在确认中」。
+_PENDING_CONFIRM: dict = {}
+
+
+async def _confirm_watch(device: dict, record: dict, cfg: dict):
+    """轮询窗口结束后继续回查容器真实状态，直到确认成功或超过确认期。
+
+    为什么需要它：拉一个大镜像往往要好几分钟，而轮询窗口默认只有 6 轮（约 1 分钟）。
+    窗口一结束就下结论，「其实已经拉完、正在重建」的更新会被记成「待确认」/失败，
+    用户永远收不到成功通知，只能一直以为都失败了。
+    这里在后台按分钟继续回查：DC 那边的 haveUpdate 一旦消失，就补发成功通知。
+    """
+    rid = str(record.get("id") or "")
+    deadline = time.time() + int(cfg.get("confirm_minutes") or 45) * 60
+    step = max(20, int(cfg.get("confirm_interval") or 60))
+    last_confirmed = None
+    try:
+        async with httpx.AsyncClient() as client:
+            while time.time() < deadline:
+                await asyncio.sleep(step)
+                if rid in DELETED_HISTORY_IDS:
+                    return
+                try:
+                    confirmed = await _confirm_container_updated(
+                        client, device, record.get("container", ""))
+                except Exception:
+                    confirmed = None
+                if confirmed is not None:
+                    last_confirmed = confirmed
+                if confirmed is True:
+                    record["status"] = "成功"
+                    record["message"] = "更新已完成（轮询窗口后持续回查确认）"
+                    record.pop("progress", None)
+                    _refresh_history(record); await _sync_out(record)
+                    if cfg.get("auto_update_success", True):
+                        try:
+                            await notify_update(record)
+                        except Exception:
+                            pass
+                    return
+                record["progress"] = ("容器仍标记为可更新，继续等待确认…"
+                                      if confirmed is False else "暂无法读取容器状态，继续等待确认…")
+                _refresh_history(record)
+            if str(record.get("status") or "") in ("进行中", "未确认", ""):
+                record.pop("progress", None)
+                if last_confirmed is False:
+                    record["status"] = "失败"
+                    record["message"] = "超过确认期容器仍标记为可更新，DockerCopilot 未实际完成更新"
+                    await _sync_out(record)
+                else:
+                    record["status"] = "未确认"
+                    record["message"] = "超过确认期仍未拿到明确结果，请到容器页确认"
+                    await _sync_out(record)
+                _refresh_history(record)
+                if cfg.get("auto_update_success", True):
+                    try:
+                        await notify_update(record)
+                    except Exception:
+                        pass
+    finally:
+        _PENDING_CONFIRM.pop(rid, None)
+
+
 async def _poll_progress(device: dict, task_id: str, record: dict, automation_cfg: dict = None):
     """后台轮询更新进度，兼容 DC 的 code/msg 和 status/progress 两种返回格式。"""
     cfg = automation_cfg or {}
@@ -1091,6 +1191,7 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
                         record["status"] = "成功"
                         record["message"] = "更新已完成（进度记录不可读，经容器状态确认）"
                         record.pop("progress", None)
+                        _refresh_history(record); await _sync_out(record)
                         if cfg.get("auto_update_success", True):
                             await notify_update(record)
                             final_notified = True
@@ -1108,6 +1209,7 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
                 if success:
                     record["status"] = "成功"
                     record["message"] = detail_msg or msg or "容器更新成功"
+                    await _sync_out(record)
                     if cfg.get("auto_update_success", True):
                         await notify_update(record)
                         final_notified = True
@@ -1115,6 +1217,7 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
                 if failed:
                     record["status"] = "失败"
                     record["message"] = detail_msg or msg or "DockerCopilot 返回更新失败"
+                    await _sync_out(record)
                     if cfg.get("auto_update_success", True):
                         await notify_update(record)
                         final_notified = True
@@ -1134,13 +1237,25 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
             if confirmed is True:
                 record["status"] = "成功"
                 record["message"] = "更新已完成（轮询未拿到终态，经容器状态确认）"
+                await _sync_out(record)
             elif confirmed is False and still_pending_hits:
                 record["status"] = "失败"
                 record["message"] = "轮询结束且容器仍标记为可更新，DockerCopilot 未实际完成更新"
+                await _sync_out(record)
             else:
                 record["status"] = "未确认"
-                record["message"] = "轮询结束，进度接口无明确终态且无法读取容器状态，请到容器页确认"
-            if cfg.get("auto_update_success", True) and not final_notified:
+                record["message"] = "轮询结束，进度接口无明确终态且无法读取容器状态，正在继续确认…"
+                await _sync_out(record)
+            _refresh_history(record)
+            # 关键：不要就此停下。拉大镜像往往超过轮询窗口，这里继续后台回查
+            # 容器真实状态，一旦确认成功就补发成功通知——否则用户只会看到
+            # 「待确认」，永远不知道其实已经更新成功了。
+            rid = str(record.get("id") or "")
+            if rid and rid not in _PENDING_CONFIRM:
+                _PENDING_CONFIRM[rid] = asyncio.create_task(
+                    _confirm_watch(device, record, cfg))
+            if cfg.get("auto_update_success", True) and not final_notified \
+                    and str(record.get("status") or "") != "未确认":
                 await notify_update(record)
     finally:
         _refresh_history(record)
@@ -1286,6 +1401,141 @@ async def get_history(request: Request, days: int = 30):
     start = (datetime.now(tz).date() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
     h = [r for r in _history() if r.get("time", "")[:10] >= start]
     return {"start": start, "records": h[:300]}
+
+
+async def _sync_out(record: dict):
+    """把终态结果回推给 MoviePilot 的 DC助手V3 插件，两边显示同一份状态。
+
+    双向同步的另一半：面板触发的更新由面板推给插件，插件触发的由插件推给面板。
+    只在设置里填了插件地址时才推；只装了其中一个的话不填即可，互不影响。
+    """
+    cfg = _config()
+    # 优先用设置里填的，没填则退回环境变量（compose 里直接配也行）
+    url = str(cfg.get("plugin_sync_url") or os.environ.get("PLUGIN_SYNC_URL") or "").strip().rstrip("/")
+    if not url:
+        return False
+    status = str(record.get("status") or "")
+    # 只同步终态，避免把「进行中」反复推过去
+    if status not in ("成功", "失败", "已跳过", "未确认", "等待中", "可更新"):
+        return False
+    token = str(cfg.get("plugin_sync_token") or os.environ.get("PLUGIN_SYNC_TOKEN") or "").strip()
+    payload = {"records": [{
+        "id": record.get("id"),
+        "time": record.get("time"),
+        "device": record.get("device") or record.get("env") or "",
+        "container": record.get("container") or "",
+        "image": record.get("image") or "",
+        "status": status,
+        "source": record.get("source") or "DC Panel",
+        "message": record.get("message") or "",
+    }]}
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.post(
+                f"{url}/api/v1/plugin/DockerCopilotHelper/sync_records",
+                json=payload,
+                headers={"X-API-KEY": token} if token else None,
+            )
+            ok = 200 <= int(r.status_code) < 300
+            if not ok:
+                print(f"[sync] 回推插件失败 {r.status_code}", flush=True)
+            return ok
+    except Exception as e:
+        print(f"[sync] 回推插件异常: {e}", flush=True)
+        return False
+
+
+def _sync_token() -> str:
+    """插件 ↔ 面板同步用的令牌：首次访问时自动生成并落盘。"""
+    cfg = _config()
+    tok = str(cfg.get("sync_token") or "").strip()
+    if not tok:
+        tok = secrets.token_hex(16)
+        cfg["sync_token"] = tok
+        _save_config(cfg)
+    return tok
+
+
+@app.post("/api/sync/records")
+async def sync_records_push(request: Request):
+    """接收外部（MoviePilot 的 DC助手V3 插件）上报的更新记录。
+
+    为什么要有这个口子：更新可能由插件触发、也可能由面板触发，两边各记一份就会
+    「这边成功那边失败」。插件把结果推过来后，面板就是统一视图——谁触发的、
+    结果是什么，两边显示一致。
+    """
+    body = await request.json()
+    token = (request.headers.get("X-Sync-Token") or ""
+             or (body.get("token") if isinstance(body, dict) else "") or "")
+    if not hmac.compare_digest(str(token), _sync_token()):
+        raise HTTPException(401, "同步令牌不匹配")
+    incoming = (body or {}).get("records") if isinstance(body, dict) else None
+    if not isinstance(incoming, list):
+        raise HTTPException(400, "records 必须是数组")
+    h = _history()
+    by_id = {str(r.get("id")): r for r in h if r.get("id")}
+    added = updated = 0
+    for rec in incoming:
+        if not isinstance(rec, dict):
+            continue
+        rid = str(rec.get("id") or "")
+        if not rid:
+            rec["id"] = secrets.token_hex(6)
+            h.insert(0, rec)
+            added += 1
+            continue
+        rec.setdefault("source", "插件同步")
+        if rid in by_id:
+            # 以「更终态」为准：成功/失败/已跳过 覆盖 进行中/未确认
+            old = by_id[rid]
+            if str(old.get("status") or "") in ("进行中", "未确认", "等待中", ""):
+                old.update(rec)
+                updated += 1
+        else:
+            h.insert(0, rec)
+            added += 1
+    h.sort(key=lambda r: str(r.get("time") or ""), reverse=True)
+    _save(HISTORY_FILE, h[:500])
+    return {"ok": True, "added": added, "updated": updated, "total": len(h[:500])}
+
+
+@app.get("/api/sync/records")
+async def sync_records_pull(request: Request):
+    """给插件拉取面板侧的更新记录，用于两边状态对齐。"""
+    token = request.headers.get("X-Sync-Token") or request.query_params.get("token") or ""
+    if not hmac.compare_digest(str(token), _sync_token()):
+        raise HTTPException(401, "同步令牌不匹配")
+    days = 7
+    try:
+        days = int(request.query_params.get("days") or 7)
+    except ValueError:
+        pass
+    tz = timezone(timedelta(hours=8))
+    start = (datetime.now(tz).date() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    h = [r for r in _history() if r.get("time", "")[:10] >= start]
+    return {"start": start, "records": h[:300]}
+
+
+@app.put("/api/sync/plugin")
+async def set_plugin_sync(request: Request):
+    """配置回推给插件的地址（MoviePilot 根地址）与 API KEY，用于双向同步。"""
+    _check_login(request)
+    body = await request.json()
+    cfg = _config()
+    cfg["plugin_sync_url"] = str((body or {}).get("url") or "").strip()
+    cfg["plugin_sync_token"] = str((body or {}).get("token") or "").strip()
+    cfg["allow_self_update"] = bool((body or {}).get("allow_self_update",
+                                                     cfg.get("allow_self_update")))
+    _save_config(cfg)
+    return {"ok": True, "url": cfg["plugin_sync_url"],
+            "allow_self_update": cfg["allow_self_update"]}
+
+
+@app.get("/api/sync/token")
+async def get_sync_token(request: Request):
+    """登录后可查看同步令牌（填到插件设置里）。"""
+    _check_login(request)
+    return {"token": _sync_token()}
 
 
 @app.delete("/api/history/{record_id}")
