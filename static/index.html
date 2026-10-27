@@ -1278,12 +1278,13 @@ function renderActiveDevice(){
       <td><button class="ghost ${c.haveUpdate?'':'dim'}" onclick="doUpdateFor('${d.id}','${cid}')">更新</button></td></tr>`;
     });
   }
-  html+=`<tr><td colspan="5" style="color:var(--sub);font-size:14px;padding-top:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-    <span>共 ${list.length} 个容器，已选 ${selN} 个（第 ${ctPage}/${totalPages} 页）</span>
-    <span style="flex:1"></span>
-    <button class="ghost sm" ${ctPage<=1?'disabled':''} onclick="ctPrev()">‹ 上一页</button>
-    <button class="ghost sm" ${ctPage>=totalPages?'disabled':''} onclick="ctNext()">下一页 ›</button>
-  </td></tr>`;
+  html+=`<tr><td colspan="5" style="padding-top:8px">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;color:var(--sub);font-size:14px">
+      <span>共 ${list.length} 个容器，已选 ${selN} 个（第 ${ctPage}/${totalPages} 页）</span>
+      <span style="flex:1"></span>
+      <button class="ghost sm" ${ctPage<=1?'disabled':''} onclick="ctPrev()">‹ 上一页</button>
+      <button class="ghost sm" ${ctPage>=totalPages?'disabled':''} onclick="ctNext()">下一页 ›</button>
+    </div></td></tr>`;
   tb.innerHTML=html;
 }
 function ctPrev(){if(ctPage>1){ctPage--;renderActiveDevice()}}
