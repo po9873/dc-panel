@@ -407,7 +407,7 @@ button.sm{font-size:13px;padding:4px 9px;border-radius:7px}
     </div>
     <div class="um-list">
       <div class="um-item" onclick="closeAppearance();switchPane('settings')"><span class="umi">⚙️</span><span class="umt">系统设置</span><span class="uma">›</span></div>
-      <div class="um-item" onclick="showUpdateTip()"><span class="umi">🔄</span><span class="umt">检查更新</span><span class="umv" id="umVer">v1.2.3</span><span class="uma">›</span></div>
+      <div class="um-item" onclick="showUpdateTip()"><span class="umi">🔄</span><span class="umt">检查更新</span><span class="umv" id="umVer">v1.2.6</span><span class="uma">›</span></div>
     </div>
     <div class="um-list">
       <div class="um-item um-danger" onclick="closeAppearance();logout()"><span class="umi">⏏</span><span class="umt">退出登录</span></div>
@@ -703,7 +703,7 @@ button.sm{font-size:13px;padding:4px 9px;border-radius:7px}
 
 <script>
 const COLORS=['#4f8cff','#3ddc84','#ffb74d','#ff6b6b','#b388ff','#4dd0e1','#f06292','#aed581'];
-let token=null,devices=[],curDev=null,containers=[],sel=new Set();
+let token=null,devices=[],curDev=null,containers=[],sel=new Set(),devCt={};
 const $=id=>document.getElementById(id);
 async function api(path,opt={}){
   const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opt});
@@ -720,7 +720,8 @@ async function checkPanelUpdate(){
     const el=$('verInfo');
     if(!el)return;
     if(d.update){el.innerHTML='<span class="upd-badge">可更新</span>';el.parentElement.title='Docker Hub 有新镜像，点击查看更新方法'}
-    else if(el.querySelector('.upd-badge')){el.textContent=d.current||'';el.parentElement.title='点击查看更新说明'}
+    // 无更新时也回写后端真实版本，避免界面一直显示打包时的硬编码版本号
+    else{el.textContent=d.current||el.textContent;el.parentElement.title='点击查看更新说明'}
   }catch(e){}
 }
 /* 定时轮询版本检查：后端带 60s 缓存 + 后台循环按用户设置的间隔查 Docker Hub，
@@ -1214,79 +1215,107 @@ async function loadDevs(){
     <div class="u">${esc(d.url)}</div>
     <div class="st"><span class="badge ${d.online?'b-ok':'b-no'}">${d.online?'在线':'离线'}</span>${d.version?`<span class="badge b-info">v${esc(d.version)}</span>`:''}<span style="flex:1"></span><button class="danger del" onclick="delDev('${d.id}')">删除</button></div></div>`).join(''):'<div class="empty">还没有设备，在下方添加</div>';
   if(!devices.find(d=>d.id===curDev)&&devices[0])curDev=devices[0].id;
-  const i=devices.findIndex(d=>d.id===curDev),n=devices.length;
-  const name=i>=0?esc(devices[i].name):'';
-  $('devTabs').innerHTML=n?`<div class="dcpg">
-    <span class="pg" onclick="stepDev(-1)" style="${i<=0?'opacity:.4;pointer-events:none':''}">‹</span>
-    <span class="dcpg-name">${name}<small style="color:var(--sub)">　${i+1} / ${n}</small></span>
-    <span class="pg" onclick="stepDev(1)" style="${i>=n-1?'opacity:.4;pointer-events:none':''}">›</span>
+  const n=devices.length;
+  // 不再用左右箭头在设备间翻页：所有设备一次性列出（每台机器一个分组）
+  $('devTabs').innerHTML=n?`<div class="dcpg" style="flex-wrap:wrap;gap:8px">
+    ${devices.map(d=>`<span class="pg" onclick="gotoDev('${d.id}')" title="定位到 ${esc(d.name)}">${esc(d.name)}</span>`).join('')}
+    <span style="color:var(--sub);font-size:14px">共 ${n} 台设备（下方按设备分组全部列出）</span>
   </div>`:'<div class="empty">还没有设备，先在上方添加</div>';
   if(!curDev&&devices[0])curDev=devices[0].id;
-  if(curDev)loadContainers();
-}function stepDev(step){
-  if(!devices.length)return;
-  const i=devices.findIndex(d=>d.id===curDev);
-  const j=Math.min(devices.length-1,Math.max(0,(i<0?0:i)+step));
-  curDev=devices[j].id;sel.clear();loadDevs();
+  loadAllContainers();
 }
-function pickDev(id){curDev=id;sel.clear();loadDevs()}
-async function loadContainers(){
+function gotoDev(id){const el=document.getElementById('devsec-'+id);if(el)el.scrollIntoView({behavior:'smooth',block:'start'})}function pickDev(id){curDev=id;sel.clear();loadDevs()}
+async function loadAllContainers(){
   $('ctTable').innerHTML='<tr><td class="empty">加载中…</td></tr>';
   try{
-    containers=await api(`/api/devices/${curDev}/containers`);
-    ctPage=1;renderContainers();
+    // 所有设备的容器一次性拉取，按设备分组展示（不再用分页/箭头翻页）
+    const res=await Promise.all((devices||[]).map(async d=>{
+      try{const l=await api(`/api/devices/${d.id}/containers`);return [d.id,Array.isArray(l)?l:[]]}
+      catch(e){return [d.id,[]]}
+    }));
+    devCt={};res.forEach(([id,list])=>{devCt[id]=list});
+    renderAllContainers();
   }catch(e){$('ctTable').innerHTML=`<tr><td class="empty">${esc(e.message)}</td></tr>`}
 }
-const CT_PAGE_SIZE=15;
-let ctPage=1;
-function renderContainers(){
-  if(!containers.length){$('ctTable').innerHTML='<tr><td class="empty">没有容器</td></tr>';return}
-  const total=Math.max(1,Math.ceil(containers.length/CT_PAGE_SIZE));
-  if(ctPage>total)ctPage=total;
-  const rows=containers.slice((ctPage-1)*CT_PAGE_SIZE,ctPage*CT_PAGE_SIZE);
-  let html=`<tr><th style="width:34px"><input type="checkbox" onchange="selAll(this.checked?1:0)" ${sel.size&&sel.size===containers.length?'checked':''}></th><th>容器</th><th class="hide-m">镜像</th><th>状态</th><th></th></tr>`;
-  html+=rows.map(c=>{
-    const id=c.id||c.name,nm=c.name||id;
-    const img=c.usingImage||c.createImage||c.image||'';
-    const st=(c.status||c.state||'').toLowerCase();
-    const running=st.includes('run')||st==='up';
-    const isDC=(img||'').toLowerCase().includes('dockercopilot');
-    return `<tr><td><input type="checkbox" ${sel.has(id)?'checked':''} onchange="tog('${id}',this.checked)"></td>
-    <td><b>${esc(nm)}</b>${isDC?' <span class="badge b-info">DC本体</span>':''}${c.haveUpdate?' <span class="badge b-warn">可更新</span>':''}</td>
-    <td class="hide-m" style="color:var(--sub);font-size:14px">${esc(img)}</td>
-    <td><span class="badge ${running?'b-ok':'b-warn'}">${esc(c.status||c.state||'未知')}</span></td>
-    <td><button class="ghost ${c.haveUpdate?'':'dim'}" onclick="doUpdate(['${id}'])">更新</button></td></tr>`}).join('');
-  if(total>1){
-    let pages='';
-    for(let p=1;p<=total;p++){
-      if(total>7&&p>2&&p<total&&Math.abs(p-ctPage)>1){if(!pages.endsWith('<span class="pg gap">…</span>'))pages+='<span class="pg gap">…</span>';continue}
-      pages+=`<span class="pg ${p===ctPage?'on':''}" onclick="ctPage=${p};renderContainers()">${p}</span>`;
+function renderAllContainers(){
+  const devs=devices||[];
+  if(!devs.length){$('ctTable').innerHTML='<tr><td class="empty">还没有设备，先在上方添加</td></tr>';return}
+  let html=`<tr><th style="width:34px"><input type="checkbox" onchange="selAll(this.checked?1:0)"></th><th>容器</th><th class="hide-m">镜像</th><th>状态</th><th></th></tr>`;
+  let all=0,selN=0;
+  devs.forEach(d=>{
+    const list=devCt[d.id]||[];
+    html+=`<tr id="devsec-${d.id}"><td colspan="5" style="background:var(--card2,rgba(127,127,127,.08))">
+      <div style="display:flex;align-items:center;gap:8px;padding:6px 2px;flex-wrap:wrap">
+        <b style="font-size:15px">${esc(d.name)}</b>
+        <span class="badge ${d.online?'b-ok':'b-no'}">${d.online?'在线':'离线'}</span>
+        ${d.version?`<span class="badge b-info">v${esc(d.version)}</span>`:''}
+        <span style="color:var(--sub);font-size:13px">${list.length} 个容器</span>
+      </div></td></tr>`;
+    if(!list.length){
+      html+=`<tr><td colspan="5" class="empty" style="padding-left:18px">${d.online?'该设备没有容器':'连不上该设备（检查地址/密钥）'}</td></tr>`;
+      return;
     }
-    html+=`<tr><td colspan="5"><div class="pager">
-      <span class="pg" onclick="if(ctPage>1){ctPage--;renderContainers()}">‹</span>
-      ${pages}
-      <span class="pg" onclick="if(ctPage<${total}){ctPage++;renderContainers()}">›</span>
-      <span style="color:var(--sub);font-size:14px;margin-left:10px">共 ${containers.length} 个</span></div></td></tr>`;
-  }
+    list.forEach(c=>{
+      all++;
+      const cid=c.id||c.name,nm=c.name||cid;
+      const key=d.id+'::'+cid;
+      if(sel.has(key))selN++;
+      const img=c.usingImage||c.createImage||c.image||'';
+      const st=(c.status||c.state||'').toLowerCase();
+      const running=st.includes('run')||st==='up';
+      const isDC=(img||'').toLowerCase().includes('dockercopilot');
+      const isPanel=(nm||'').toLowerCase().includes('dc-panel')||(img||'').toLowerCase().includes('dc-panel');
+      html+=`<tr><td><input type="checkbox" ${sel.has(key)?'checked':''} onchange="tog('${key}',this.checked)"></td>
+      <td><b>${esc(nm)}</b>${isDC?' <span class="badge b-info">DC本体</span>':''}${isPanel?' <span class="badge b-warn">面板自身</span>':''}${c.haveUpdate?' <span class="badge b-warn">可更新</span>':''}</td>
+      <td class="hide-m" style="color:var(--sub);font-size:14px">${esc(img)}</td>
+      <td><span class="badge ${running?'b-ok':'b-warn'}">${esc(c.status||c.state||'未知')}</span></td>
+      <td><button class="ghost ${c.haveUpdate?'':'dim'}" onclick="doUpdateFor('${d.id}','${cid}')">更新</button></td></tr>`;
+    });
+  });
+  html+=`<tr><td colspan="5" style="color:var(--sub);font-size:14px;padding-top:8px">共 ${all} 个容器，已选 ${selN} 个（按设备分组，全部列出）</td></tr>`;
   $('ctTable').innerHTML=html;
 }
 function tog(id,on){on?sel.add(id):sel.delete(id)}
-function selAll(on){sel=on?new Set(containers.map(c=>c.id||c.name)):new Set();loadContainers()}
+function selAll(on){
+  sel=new Set();
+  if(on){(devices||[]).forEach(d=>{(devCt[d.id]||[]).forEach(c=>{sel.add(d.id+'::'+(c.id||c.name))})})}
+  renderAllContainers();
+}
 async function addDev(){
   try{await api('/api/devices',{method:'POST',body:JSON.stringify({name:$('nName').value,url:$('nUrl').value,secretKey:$('nKey').value})});
     $('nName').value=$('nUrl').value=$('nKey').value='';loadDevs()}catch(e){alert(e.message)}
 }
 async function delDev(id){if(!confirm('确定删除该设备？'))return;await api('/api/devices/'+id,{method:'DELETE'});if(curDev===id)curDev=null;loadDevs()}
-async function doUpdate(ids){
-  const list=ids||[...sel];
-  if(!list.length){alert('请先勾选要更新的容器');return}
-  if(!confirm(`确定更新 ${list.length} 个容器？`))return;
+async function doUpdateFor(devId,cid){
+  const dev=(devices||[]).find(d=>d.id===devId);
+  if(!dev){alert('设备不存在');return}
+  if(!confirm(`确定更新 ${dev.name} 上的容器 ${cid}？`))return;
   $('updBtn').disabled=true;$('updMsg').textContent='提交中…';
   try{
-    const r=await api(`/api/devices/${curDev}/update`,{method:'POST',body:JSON.stringify({containerIds:list})});
+    const r=await api(`/api/devices/${devId}/update`,{method:'POST',body:JSON.stringify({containerIds:[cid]})});
     const ok=r.filter(x=>x.ok).length;
     $('updMsg').textContent=`已提交 ${ok}/${r.length} 个，稍后看更新记录`;
-    sel.clear();setTimeout(()=>{loadHist();loadStats()},2000);
+    setTimeout(()=>{loadHist();loadStats();loadAllContainers()},2000);
+  }catch(e){$('updMsg').textContent='失败：'+e.message}
+  $('updBtn').disabled=false;
+}
+async function doUpdate(){
+  // sel 里的 key 形如 "<设备ID>::<容器ID>"，按设备分组分别提交
+  const byDev={};
+  sel.forEach(k=>{const i=k.indexOf('::');if(i<0)return;const dev=k.slice(0,i),cid=k.slice(i+2);(byDev[dev]=byDev[dev]||[]).push(cid)});
+  const entries=Object.entries(byDev);
+  if(!entries.length){alert('请先勾选要更新的容器');return}
+  const total=entries.reduce((s,e)=>s+e[1].length,0);
+  if(!confirm(`确定更新 ${total} 个容器（涉及 ${entries.length} 台设备）？`))return;
+  $('updBtn').disabled=true;$('updMsg').textContent='提交中…';
+  let ok=0,all=0;
+  try{
+    for(const [dev,ids] of entries){
+      const r=await api(`/api/devices/${dev}/update`,{method:'POST',body:JSON.stringify({containerIds:ids})});
+      ok+=r.filter(x=>x.ok).length;all+=r.length;
+    }
+    $('updMsg').textContent=`已提交 ${ok}/${all} 个，稍后看更新记录`;
+    sel.clear();setTimeout(()=>{loadHist();loadStats();loadAllContainers()},2000);
   }catch(e){$('updMsg').textContent='失败：'+e.message}
   $('updBtn').disabled=false;
 }
@@ -1353,7 +1382,7 @@ function renderSide(){
     <div class="side-logout" onclick="logout()"><span class="li">⏏</span><span class="lbl">退出登录</span></div>
     <div class="side-meta">
       <div class="meta-row ver-row" onclick="showUpdateTip()" title="点击查看更新说明" style="cursor:pointer">
-        <span class="muted">版本</span><span id="verInfo">v1.2.3</span>
+        <span class="muted">版本</span><span id="verInfo">v1.2.6</span>
       </div>
       <div class="meta-row"><span class="muted">作者</span><span>po9873</span></div>
     </div>
@@ -1412,7 +1441,7 @@ let curPane='overview';
 function switchPane(id){
   curPane=id;renderSide();
   document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('on',p.dataset.pane===id));
-  if(id==='containers'&&curDev)loadContainers();
+  if(id==='containers')loadAllContainers();
   if(id==='automation')loadAutomation();
   window.scrollTo({top:0,behavior:'smooth'});
 }

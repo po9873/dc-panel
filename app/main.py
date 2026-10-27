@@ -509,7 +509,7 @@ async def status(request: Request):
 # ---------- 面板自身更新检测（Docker Hub） ----------
 
 HUB_REPO = os.environ.get("PANEL_HUB_REPO", "<dockerhub-user>/dc-panel")
-APP_VERSION = "v1.2.5"
+APP_VERSION = "v1.2.6"
 
 def _boot_time():
     try:
@@ -968,6 +968,25 @@ def _ok_code(code) -> bool:
         return False
 
 
+# DockerCopilot 的 /api/progress 会返回 status 字段，但各版本取值混乱：
+# 有的给 completed/success，有的在拉取过程中就给 pulling/downloading/running。
+# 旧逻辑把「status 非空」一律当成终态，于是拉取中途只要 message 里出现过
+# 「失败/错误/error」（某一层拉取重试很常见）就被判失败并推送给客户。
+# 这里显式区分：运行态不算终态，只有明确的完成/失败/取消才算。
+_STATUS_DONE = ("completed", "complete", "success", "succeeded", "done", "finished", "ok")
+_STATUS_BAD = ("failed", "failure", "error", "canceled", "cancelled", "cancel", "timeout")
+_STATUS_RUNNING = ("running", "pulling", "download", "downloading", "extract", "extracting",
+                   "creating", "starting", "pending", "waiting", "in_progress", "inprogress",
+                   "processing", "progress", "updating", "active", "")
+
+
+def _is_terminal_status(status: str) -> bool:
+    s = str(status or "").strip().lower()
+    if not s or s in _STATUS_RUNNING:
+        return False
+    return s in _STATUS_DONE or s in _STATUS_BAD
+
+
 async def _confirm_container_updated(client, device: dict, container_name: str):
     """DC 自更新会重启自身，内存里的进度记录随之丢失，/api/progress 报
     "taskID 未找到"。此时回查容器列表：haveUpdate 消失即更新已完成。
@@ -978,8 +997,12 @@ async def _confirm_container_updated(client, device: dict, container_name: str):
         data = await dc_get(client, device, "/api/containers")
     except Exception:
         return None
+    target = str(container_name or "").strip()
     for c in _container_array(data):
-        if str(c.get("name") or c.get("id") or "").strip() == container_name:
+        nm = str(c.get("name") or "").strip()
+        cid = str(c.get("id") or "").strip()
+        if target and (nm == target or (cid and (cid == target or cid.startswith(target[:12])
+                                                 or target.startswith(cid[:12])))):
             return not _is_true(c.get("haveUpdate"))
     return None
 
@@ -988,6 +1011,7 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
     """后台轮询更新进度，兼容 DC 的 code/msg 和 status/progress 两种返回格式。"""
     cfg = automation_cfg or {}
     final_notified = False
+    still_pending_hits = 0
     try:
         async with httpx.AsyncClient() as client:
             for _ in range(max(1, int(cfg.get("interval_limit") or 6))):
@@ -1006,31 +1030,6 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
                 code = p.get("code")
                 percentage = detail.get("percentage", p.get("percentage"))
                 detail_msg = str(detail.get("detailMsg") or detail.get("message") or msg)
-                # DC 的进度记录在内存中：更新 dockercopilot 自身会导致 DC 重启、
-                # 进度记录被清空，/api/progress 返回 400 "taskID 未找到"。
-                # 这不是更新失败——回查容器状态确认真实结果，避免误报。
-                task_lost = (not _ok_code(code)) and (
-                    "未找到" in msg or "not found" in msg.lower())
-                if task_lost:
-                    confirmed = await _confirm_container_updated(client, device, record.get("container", ""))
-                    if confirmed is True:
-                        record["status"] = "成功"
-                        record["message"] = "更新已完成（DC 重启后进度记录已清除，经容器状态确认）"
-                        record.pop("progress", None)
-                        if cfg.get("auto_update_success", True):
-                            await notify_update(record)
-                            final_notified = True
-                        break
-                    if confirmed is False:
-                        record["status"] = "失败"
-                        record["message"] = "DockerCopilot 更新任务不存在，且容器仍标记为可更新"
-                        record.pop("progress", None)
-                        if cfg.get("auto_update_success", True):
-                            await notify_update(record)
-                            final_notified = True
-                        break
-                    # 容器列表也查不到（DC 可能正在重启）：继续轮询，不误判
-                    continue
                 if percentage is not None:
                     record["progress"] = f"{percentage}% {detail_msg}".strip()
                 else:
@@ -1038,18 +1037,42 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
                 is_done = _is_true(detail.get("isDone", p.get("isDone")))
                 is_failed = _is_true(detail.get("failed", p.get("failed")))
                 is_canceled = _is_true(detail.get("canceled", p.get("canceled")))
-                # 终态信号：DC 明确给出完成/失败/取消，或 status 有值
-                terminal = is_done or is_failed or is_canceled or bool(status)
+                # 终态只认明确信号：isDone/failed/canceled，或 status 是完成/失败类取值。
+                # running/pulling/downloading 等运行态一律不算终态。
+                status_terminal = _is_terminal_status(status)
+                terminal = is_done or is_failed or is_canceled or status_terminal
                 success = (is_done and not is_failed and not is_canceled) \
-                    or status in ("completed", "complete", "success", "done") \
-                    or (_ok_code(code) and any(x in msg.lower() for x in ("成功", "success", "完成", "completed")))
+                    or status in _STATUS_DONE
                 # 失败只在明确终态时判定：拉取镜像过程中 progress message 常出现
                 # 「失败/错误/error」（某一层拉取重试的字样），据此判失败会不停给客户
                 # 推送「拉取失败」的误报。字符串匹配仅在已到终态时才作为收尾依据。
                 failed = is_failed or is_canceled \
-                    or status in ("failed", "failure", "error", "canceled", "cancelled") \
-                    or (not _ok_code(code)) \
+                    or status in _STATUS_BAD \
                     or (terminal and any(x in msg.lower() for x in ("失败", "错误", "failed", "error", "取消", "canceled")))
+                # 进度接口读不到（DC 重启 / 任务记录被清 / 返回异常码 / 404 等）：
+                # 一律不做失败判定。DC 实际可能已经拉取并重建完成，只是进度查不到，
+                # 直接判失败就会把「其实成功」的更新误报成失败推给客户。
+                # 这里回查容器真实状态，确认不了就继续轮询，由窗口结束时做最终判定。
+                explicit_fail = is_failed or is_canceled or status in _STATUS_BAD
+                if not _ok_code(code) and not explicit_fail:
+                    record["progress"] = f"进度不可读（code={code}），正在核对容器状态…"
+                    confirmed = await _confirm_container_updated(client, device, record.get("container", ""))
+                    if confirmed is True:
+                        record["status"] = "成功"
+                        record["message"] = "更新已完成（进度记录不可读，经容器状态确认）"
+                        record.pop("progress", None)
+                        if cfg.get("auto_update_success", True):
+                            await notify_update(record)
+                            final_notified = True
+                        break
+                    if confirmed is False:
+                        # 容器仍标记为可更新：DC 可能还没刷新，先记下来继续等，
+                        # 连续确认到仍可更新才在窗口结束时判失败。
+                        still_pending_hits += 1
+                        _refresh_history(record)
+                        continue
+                    _refresh_history(record)
+                    continue
                 if cfg.get("schedule_report") and not (success or failed):
                     await notify_update({**record, "status": "进度", "message": msg})
                 if success:
@@ -1068,8 +1091,25 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
                     break
                 _refresh_history(record)
         if record["status"] == "进行中":
-            record["status"] = "已完成（未确认结果）"
-            record["message"] = "轮询结束，DockerCopilot 未返回明确终态"
+            # 轮询窗口结束仍无明确终态：不猜、不直接判失败。
+            # 回查容器真实状态——DC 常常已经拉取并重建完成，只是进度接口读不到。
+            # 只有「容器确实仍标记为可更新」才判失败；查不到就记未确认，绝不误报失败。
+            try:
+                async with httpx.AsyncClient() as client:
+                    confirmed = await _confirm_container_updated(
+                        client, device, record.get("container", ""))
+            except Exception:
+                confirmed = None
+            record.pop("progress", None)
+            if confirmed is True:
+                record["status"] = "成功"
+                record["message"] = "更新已完成（轮询未拿到终态，经容器状态确认）"
+            elif confirmed is False and still_pending_hits:
+                record["status"] = "失败"
+                record["message"] = "轮询结束且容器仍标记为可更新，DockerCopilot 未实际完成更新"
+            else:
+                record["status"] = "未确认"
+                record["message"] = "轮询结束，进度接口无明确终态且无法读取容器状态，请到容器页确认"
             if cfg.get("auto_update_success", True) and not final_notified:
                 await notify_update(record)
     finally:
