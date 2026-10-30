@@ -346,9 +346,20 @@ async def startup():
             rid = str(rec.get("id") or "")
             if not rid or rid in _PENDING_CONFIRM:
                 continue
+            # 面板自身容器更新会重启进程：设备名若因任何原因匹配不上，原逻辑会
+            # 直接放弃续查，记录永远停在「进行中」并触发下一轮重复更新。自更新
+            # 记录降级为用第一个设备续查（确认逻辑对自更新走启动时间快判，不依赖
+            # 设备名定位容器），避免断链。
+            is_self = _is_self_name(str(rec.get("container") or ""),
+                                   str(rec.get("image") or ""))
             dev = next((d for d in _devices() if d.get("name") == rec.get("device")), None)
-            if not dev:
-                continue
+            if dev is None:
+                if not is_self:
+                    continue
+                devs = _devices()
+                if not devs:
+                    continue
+                dev = devs[0]
             print(f"[startup] 续查未完成记录：{rec.get('device')}/{rec.get('container')}", flush=True)
             _PENDING_CONFIRM[rid] = asyncio.create_task(
                 _confirm_watch(dev, rec, _automation_config()))
@@ -893,10 +904,17 @@ async def _scan_device_updates(device: dict, containers: list, client, cfg: dict
         fingerprint = image + "|" + str(c.get("latestImage") or c.get("updateImage") or c.get("tag") or "")
         if auto:
             entry = pending.get(key, {})
+            # 面板自身容器更新会重启进程，内存里的 pending 一并丢失。上一轮
+            # 自更新若还没确认完就重复提交，DC 会不停重建面板（反复重启+刷通知）。
+            # 用落盘历史做跨重启去重：最近确认窗口内已有未完成自更新则跳过。
+            if _is_self_name(name, image) and _recent_unfinished_self_update(
+                    device["name"], name, int(cfg.get("confirm_minutes") or 45)):
+                print(f"[auto] 跳过重复自更新：{name}（上一次尚未确认完成）", flush=True)
+                continue
             # 只有更新任务已成功提交才去重。旧版本在请求前就写指纹，失败后会
             # 永久跳过同一镜像；没有 auto_status 的旧记录按失败状态重新尝试。
             if (entry.get("auto_fingerprint") == fingerprint
-                    and entry.get("auto_status") == "submitted"):
+                and entry.get("auto_status") == "submitted"):
                 continue
             record = {
                 "id": secrets.token_hex(6), "time": _record_time(), "device": device["name"],
@@ -1079,6 +1097,39 @@ def _record_dt(record) -> "datetime | None":
         return None
 
 
+def _recent_unfinished_self_update(device_name: str, container: str,
+                                   window_min: int = 45) -> bool:
+    """跨重启去重（仅面板自身容器更新需要）。
+
+    面板更新自己会先停掉自身进程，内存里的 pending 随进程一起丢失，无法再靠
+    auto_fingerprint 挡住重复提交。若上次自更新尚未确认完成就再次提交，
+    DockerCopilot 会不停重建面板，造成「面板反复重启 + 反复发通知」的死循环。
+
+    这里直接查落盘的历史记录：最近确认窗口内若已有同一设备的「未完成自更新」
+    记录，就说明上一次还在等确认，本轮跳过，不二次重启面板。
+    """
+    try:
+        cut = time.time() - max(1, int(window_min)) * 60
+        nm = str(container or "").strip().lower()
+        for rec in _history():
+            if str(rec.get("device") or "") != str(device_name or ""):
+                continue
+            if not _is_self_name(str(rec.get("container") or ""),
+                                str(rec.get("image") or "")):
+                continue
+            if str(rec.get("container") or "").strip().lower() != nm:
+                continue
+            st = str(rec.get("status") or "")
+            if st not in ("进行中", "已触发", "未确认", "等待中"):
+                continue
+            t = _record_dt(rec)
+            if t is not None and t.timestamp() >= cut:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _parse_dt_loose(v):
     """宽容解析容器创建时间：epoch 秒/毫秒、ISO 字符串、"YYYY-MM-DD HH:MM:SS"。"""
     if v is None:
@@ -1225,7 +1276,12 @@ async def _confirm_watch(device: dict, record: dict, cfg: dict):
                 record.pop("progress", None)
                 if last_confirmed is False:
                     record["status"] = "失败"
-                    record["message"] = "超过确认期容器仍标记为可更新，DockerCopilot 未实际完成更新"
+                    msg = "超过确认期容器仍标记为可更新，DockerCopilot 未实际完成更新"
+                    if _is_self_name(str(record.get("container") or ""),
+                                    str(record.get("image") or "")):
+                        msg += "。若面板仍在正常运行，说明 DC 未重建面板容器，" \
+                               "请到宿主机执行：docker compose pull && docker compose up -d"
+                    record["message"] = msg
                     await _sync_out(record)
                 else:
                     record["status"] = "未确认"
