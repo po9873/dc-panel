@@ -1322,6 +1322,13 @@ async def _poll_progress(device: dict, task_id: str, record: dict, automation_cf
                     else:
                         should_push = pct >= prog_last_pct + 20 or now_ts - prog_last_ts >= 180
                     if should_push:
+                        # DC 应答体里的通用 success/ok（接口调通而已）没有信息量，
+                        # 推出去用户只会看到「详情: success」的莫名通知；只有带
+                        # 百分比或有实质进度文案时才值得推。
+                        info = str(msg or "").strip()
+                        if pct < 0 and info.lower() in ("success", "ok", "done", "成功"):
+                            should_push = False
+                    if should_push:
                         if pct >= 0:
                             prog_last_pct = pct
                         prog_last_ts = now_ts
@@ -1974,17 +1981,34 @@ DEFAULT_TEMPLATE = ("{emoji} DC Panel 容器更新{status}\n"
                     "{extra}")
 
 
+# 状态 → (emoji, 展示文案)。渲染层此前只认「成功」，其余一律显示成 ❌ 失败——
+# 于是轮询中的「进度」推送（28% 正在拉取镜像）也被渲染成「容器更新失败」，
+# 用户在镜像明明拉到一半时收到失败通知，全是这个映射造成的假失败。
+# 文案需能接在「容器更新」后面读得通（如「容器更新进行中」）。
+_STATUS_LABEL = {
+    "成功": ("✅", "成功"),
+    "失败": ("❌", "失败"),
+    "已跳过": ("⏭️", "已跳过"),
+    "可更新": ("🔔", "发现新版本"),
+    "已触发": ("🚀", "已开始"),
+    "进度": ("⏳", "进行中"),
+    "未确认": ("❓", "结果待确认"),
+    "等待中": ("⌛", "等待重试"),
+}
+
+
 def _render_text(record: dict) -> str:
     tpl = ((_config().get("notify") or {}).get("template") or "").strip() or DEFAULT_TEMPLATE
-    ok = record.get("status") == "成功"
+    status = str(record.get("status") or "")
+    emoji, label = _STATUS_LABEL.get(status, ("🔔", status or "有更新动态"))
     extra = ""
     if record.get("message"):
         extra += f"\n详情：{record['message']}"
     if record.get("progress"):
         extra += f"\n进度：{record['progress']}"
     fields = {
-        "emoji": "✅" if ok else "❌",
-        "status": "成功" if ok else "失败",
+        "emoji": emoji,
+        "status": label,
         "device": record.get("device", ""),
         "container": record.get("container", ""),
         "image": record.get("image", ""),
