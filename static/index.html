@@ -1223,13 +1223,18 @@ function pickDev(id){curDev=id;sel.clear();ctPage=1;renderDevTabs();renderActive
 async function loadAllContainers(){
   $('ctTable').innerHTML='<tr><td class="empty">加载中…</td></tr>';
   try{
-    // 所有设备的容器一次性拉取，按设备分组展示（不再用分页/箭头翻页）
-    const res=await Promise.all((devices||[]).map(async d=>{
-      try{const l=await api(`/api/devices/${d.id}/containers`);return [d.id,Array.isArray(l)?l:[]]}
-      catch(e){return [d.id,[]]}
-    }));
-    devCt={};res.forEach(([id,list])=>{devCt[id]=list});
-    renderActiveDevice();
+    // 各设备独立请求、独立渲染：不再 Promise.all 等最慢一台。
+    // 否则一台慢/离线设备（后端超时 15 秒）会把整页卡在"加载中…"。
+    const list=(devices||[]);
+    if(!list.length){devCt={};renderActiveDevice();return}
+    devCt={};
+    list.forEach(async d=>{
+      let l=[];
+      try{const r=await api(`/api/devices/${d.id}/containers`);l=Array.isArray(r)?r:[]}
+      catch(e){l=[]}
+      devCt[d.id]=l;
+      if(d.id===curDev)renderActiveDevice();
+    });
   }catch(e){$('ctTable').innerHTML=`<tr><td class="empty">${esc(e.message)}</td></tr>`}
 }
 function renderDevTabs(){
@@ -1243,6 +1248,7 @@ function renderActiveDevice(){
   const d=devices.find(x=>x.id===curDev);
   const tb=$('ctTable');
   if(!d){tb.innerHTML='<tr><td class="empty">请选择上方的一台设备</td></tr>';return}
+  if(devCt[d.id]===undefined){tb.innerHTML='<tr><td class="empty">加载中…</td></tr>';return}
   const list=devCt[d.id]||[];
   const PAGE=10;
   const totalPages=Math.max(1,Math.ceil(list.length/PAGE));

@@ -750,8 +750,8 @@ def _save_devices(devices: list):
 async def list_devices(request: Request):
     _check_login(request)
     async with httpx.AsyncClient() as client:
-        out = []
-        for d in _devices():
+
+        async def probe(d):
             item = {"id": d["id"], "name": d["name"], "url": d["url"]}
             try:
                 r = await client.get(d["url"].rstrip("/") + "/api/version",
@@ -762,8 +762,12 @@ async def list_devices(request: Request):
                     item["version"] = v.get("version") or v.get("Version") or ""
             except Exception:
                 item["online"] = False
-            out.append(item)
-        return out
+            return item
+
+        # 并发探测所有设备：串行时每台最长 6 秒，设备多/有离线设备时
+        # 设备列表接口会把页面卡住（5 台 2 台离线就是 12 秒+）。
+        # 并发后总耗时≈最慢一台。
+        return await asyncio.gather(*(probe(d) for d in _devices()))
 
 
 @app.post("/api/devices")
