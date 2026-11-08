@@ -661,6 +661,10 @@ PANEL_UPDATE_STATE = {
     "build_time": None, "checked_at": 0.0, "notified_hub_time": None,
 }
 PANEL_UPDATE_CACHE_TTL = 60.0
+# 构建容差：BUILD_TIME 是 CI 里执行 date 的时刻（构建开始），而远端 manifest 的
+# created 是构建完成时刻，两者天然差几秒到几十秒。不加容差的话，刚部署的新镜像
+# 会立刻被判成「有新版本」。300 秒足以覆盖一次构建，又不影响真正的下次发版。
+PANEL_UPDATE_GRACE_SEC = int(os.environ.get("PANEL_UPDATE_GRACE_SEC", "300") or 300)
 
 _SOURCE_LABEL = {"ghcr": "GitHub 镜像仓库", "mirror": "局域网镜像站", "hub": "Docker Hub"}
 
@@ -773,12 +777,13 @@ async def _check_panel_update(notify: bool = False) -> dict:
         order = [last_ok] + [s for s in order if s != last_ok]
 
     update, hub_time, used, errors = False, None, None, {}
+    deadline = build_time + timedelta(seconds=PANEL_UPDATE_GRACE_SEC)
     async with httpx.AsyncClient(timeout=6, follow_redirects=True) as cli:
         for name in order:
             try:
                 remote, used = await handlers[name](cli)
                 hub_time = remote.isoformat().replace("+00:00", "Z")
-                update = remote > build_time
+                update = remote > deadline
                 break
             except Exception as e:
                 used = None
