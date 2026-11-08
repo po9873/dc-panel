@@ -126,11 +126,25 @@ def case_build_time_priority():
     print("ok 6 构建时间优先读 BUILD_TIME，缺失时安全回退")
 
 
+def case_grace_window():
+    """构建开始/完成的几秒差不能被当成新版本（刚部署就亮红点）。"""
+    calls = reset()
+    m._src_registry = stub(calls, "ghcr", ret=NOW + timedelta(seconds=10))
+    st = run(m._check_panel_update())
+    assert st["update"] is False, "容差内的构建时间差不应判可更新"
+    calls = reset()
+    m._src_registry = stub(calls, "ghcr", ret=NOW + timedelta(seconds=m.PANEL_UPDATE_GRACE_SEC + 5))
+    st = run(m._check_panel_update())
+    assert st["update"] is True, "超过容差窗口应判可更新"
+    print("ok 7 构建容差窗口内不误报，超出才报")
+
+
 if __name__ == "__main__":
     case_prefer_ghcr()
     case_fallback_and_errors()
     case_all_fail()
     case_sticky_source()
     case_time_parse()
+    case_grace_window()
     case_build_time_priority()
     print("ALL PASS")
