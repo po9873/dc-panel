@@ -719,9 +719,21 @@ async function checkPanelUpdate(){
     const d=await api('/api/version/check');
     const el=$('verInfo');
     if(!el)return;
-    if(d.update){el.innerHTML='<span class="upd-badge">可更新</span>';el.parentElement.title='Docker Hub 有新镜像，点击查看更新方法'}
+    const srcMap={ghcr:'GitHub 镜像仓库',mirror:'局域网镜像站',hub:'Docker Hub'};
+    const src=srcMap[d.source]||'镜像仓库';
+    if(d.update){el.innerHTML='<span class="upd-badge">可更新</span>';el.parentElement.title=`${src} 有新镜像（构建于 ${d.hub_time||'未知'}），点击查看更新方法`}
     // 无更新时也回写后端真实版本，避免界面一直显示打包时的硬编码版本号
-    else{el.textContent=d.current||el.textContent;el.parentElement.title='点击查看更新说明'}
+    else{
+      const errs=d.errors||{}, keys=Object.keys(errs);
+      el.textContent=d.current||el.textContent;
+      if(!d.source&&keys.length){
+        // 所有检测源都失败：把原因摆出来，不能继续伪装成「无更新」
+        el.innerHTML=`${d.current||''} <span style="color:#e0a33b;font-size:11px">⚠</span>`;
+        el.parentElement.title='版本检测失败 — '+keys.map(k=>`${srcMap[k]||k}: ${errs[k]}`).join(' | ');
+      }else{
+        el.parentElement.title=`已通过${src}检测：无新镜像`;
+      }
+    }
   }catch(e){}
 }
 /* 定时轮询版本检查：后端带 60s 缓存 + 后台循环按用户设置的间隔查 Docker Hub，
