@@ -787,7 +787,9 @@ async def _check_panel_update(notify: bool = False) -> dict:
                 break
             except Exception as e:
                 used = None
-                errors[name] = f"{type(e).__name__}: {str(e)[:80]}"
+                cause = getattr(e, "__cause__", None)
+                detail = str(e) or (repr(cause) if cause else "") or repr(e)
+                errors[name] = f"{type(e).__name__}: {detail[:100]}"
 
     state.update({
         "update": update, "hub_time": hub_time, "checked_at": now_ts,
