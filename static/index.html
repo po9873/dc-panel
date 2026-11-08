@@ -1278,10 +1278,10 @@ function renderActiveDevice(){
       const isDC=(img||'').toLowerCase().includes('dockercopilot');
       const isPanel=(nm||'').toLowerCase().includes('dc-panel')||(img||'').toLowerCase().includes('dc-panel');
       html+=`<tr><td><input type="checkbox" ${sel.has(key)?'checked':''} onchange="tog('${key}',this.checked)"></td>
-      <td><b>${esc(nm)}</b>${isDC?' <span class="badge b-info">DC本体</span>':''}${isPanel?' <span class="badge b-warn">面板自身</span>':''}${c.haveUpdate?' <span class="badge b-warn">可更新</span>':''}</td>
+      <td><b>${esc(nm)}</b>${isDC?' <span class="badge b-info">DC本体</span>':''}${isPanel?' <span class="badge b-info" title="本面板自己的容器，只是标识，不代表有更新">面板自身</span>':''}${c.haveUpdate?' <span class="badge b-warn">可更新</span>':''}</td>
       <td class="hide-m" style="color:var(--sub);font-size:14px">${esc(img)}</td>
       <td><span class="badge ${running?'b-ok':'b-warn'}">${esc(c.status||c.state||'未知')}</span></td>
-      <td><button class="ghost ${c.haveUpdate?'':'dim'}" onclick="doUpdateFor('${d.id}','${cid}')">更新</button></td></tr>`;
+      <td>${c.haveUpdate?`<button class="ghost" onclick="doUpdateFor('${d.id}','${cid}')">更新</button>`:'<span style="color:var(--sub);font-size:13px">已是最新</span>'}</td></tr>`;
     });
   }
   html+=`<tr><td colspan="5" style="padding-top:8px">
