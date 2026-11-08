@@ -571,29 +571,98 @@ async def status(request: Request):
             "has_bg_light": bool(cfg.get("bg_light"))}
 
 
-# ---------- 面板自身更新检测（Docker Hub） ----------
+# ---------- 面板自身更新检测（多源：ghcr / 局域网镜像 / Docker Hub） ----------
 
-HUB_REPO = os.environ.get("PANEL_HUB_REPO", "<dockerhub-user>/dc-panel")
-APP_VERSION = "v1.3.0"
+# 面板真实发布仓库。默认值必须是真仓库：历史默认值是字面量占位符
+# "<dockerhub-user>/dc-panel"，没配环境变量时就等于永远查一个不存在的仓库。
+HUB_REPO = os.environ.get("PANEL_HUB_REPO", "po9873/dc-panel").strip() or "po9873/dc-panel"
+# 检测源优先级。默认 ghcr 优先：面板镜像本身就发在 ghcr，且国内可直连；
+# 其次局域网 registry 镜像（省外网、断网也能用）；最后才是 Docker Hub ——
+# hub.docker.com 在国内会被按 TLS SNI 直接 RST（TCP 能连上，握手一报 SNI 就断），
+# 换成哪个 Cloudflare IP 都没用，所以它只能当境外部署的兜底，不能是唯一来源。
+PANEL_UPDATE_SOURCES = [s.strip().lower() for s in
+                        os.environ.get("PANEL_UPDATE_SOURCES", "ghcr,mirror,hub").split(",")
+                        if s.strip()]
+# 可选的局域网/私有 registry（Docker Hub 镜像站），形如 host:port
+PANEL_MIRROR_REGISTRY = (os.environ.get("PANEL_MIRROR_REGISTRY")
+                         or "registry.linkease.net:5443").strip().rstrip("/")
+APP_VERSION = "v1.4.0"
+
+
+def _parse_time(value):
+    """把各种 ISO 时间串（Z 结尾 / 带偏移 / 无时区）统一成 UTC datetime。"""
+    if not value:
+        return None
+    try:
+        s = str(value).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
 
 def _boot_time():
+    """本容器 1 号进程的启动时间。
+
+    旧实现直接读 /proc/1/stat 的第 22 个字段当 btime——那是「进程启动以来的
+    clock tick 数」，不是时间戳，算出来是 1970 年，导致版本比较失去意义。
+    正确做法：/proc/stat 的 btime（系统启动时间戳）+ /proc/1/stat 的 starttime。
+    """
     try:
+        btime = None
+        with open("/proc/stat") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    btime = int(line.split()[1])
+                    break
         with open("/proc/1/stat") as f:
-            fields = f.read().split()
-        btime = int(fields[21])
-        return datetime.fromtimestamp(btime / 100, tz=timezone.utc)
+            raw = f.read()
+        # comm 字段可能带空格，先按最后一个 ")" 切开再数字段
+        fields = raw.rsplit(")", 1)[1].split()
+        starttime = int(fields[19])  # 整体第 22 个字段：进程启动的 clock tick 数
+        hz = os.sysconf("SC_CLK_TCK") or 100
+        if btime:
+            return datetime.fromtimestamp(btime + starttime / hz, tz=timezone.utc)
+    except Exception:
+        pass
+    try:  # 读不到就按系统运行时长回退，至少不会得到 1970 年
+        with open("/proc/uptime") as f:
+            return datetime.now(timezone.utc) - timedelta(seconds=float(f.read().split()[0]))
     except Exception:
         return datetime.now(timezone.utc) - timedelta(days=3650)
+
+
+def _image_build_time():
+    """本镜像的构建时间（用于和远端 latest 比较）。
+
+    优先读构建期写进镜像的 /app/BUILD_TIME。不能只看容器启动时间：容器一重启，
+    启动时间就晚于镜像构建时间，会把「确实有新镜像」误判成「没有更新」。
+    老镜像没有 BUILD_TIME 时才退回启动时间。
+    """
+    for path in (BASE_DIR / "BUILD_TIME", Path("/app/BUILD_TIME")):
+        try:
+            t = _parse_time(path.read_text(encoding="utf-8"))
+        except Exception:
+            t = None
+        if t:
+            return t
+    return _boot_time()
 
 # 面板自身版本自检状态（进程内）。checked_at 用于节流：前端定时轮询命中
 # /api/version/check 时直接读缓存，不会反复打 Docker Hub；真正按用户设置的
 # 间隔查询由 _automation_loop 完成——间隔改后下一次循环（≤20 秒）即生效。
 PANEL_UPDATE_STATE = {
     "current": APP_VERSION, "repo": HUB_REPO,
-    "update": False, "hub_time": None,
-    "checked_at": 0.0, "notified_hub_time": None,
+    "update": False, "hub_time": None, "source": None, "errors": {},
+    "build_time": None, "checked_at": 0.0, "notified_hub_time": None,
 }
 PANEL_UPDATE_CACHE_TTL = 60.0
+
+_SOURCE_LABEL = {"ghcr": "GitHub 镜像仓库", "mirror": "局域网镜像站", "hub": "Docker Hub"}
 
 
 async def _notify_panel_update(hub_time):
@@ -602,22 +671,86 @@ async def _notify_panel_update(hub_time):
     if state["notified_hub_time"] == hub_time:
         return
     state["notified_hub_time"] = hub_time
+    label = _SOURCE_LABEL.get(state.get("source") or "", "镜像仓库")
     record = {
         "id": secrets.token_hex(6), "time": _record_time(), "device": "本机",
         "container": "dc-panel", "image": f"{HUB_REPO}:latest",
         "status": "可更新", "source": "面板自检",
-        "message": f"Docker Hub 已发布新镜像（构建于 {hub_time}），当前容器启动于更早版本",
+        "message": f"{label} 已发布新镜像（构建于 {hub_time}），当前容器镜像更早",
     }
     await notify_update(record)
 
 
-async def _check_panel_update(notify: bool = False) -> dict:
-    """对照 Docker Hub latest 的构建时间与容器启动时间，判断面板是否有新版。
+async def _src_hub(cli):
+    """Docker Hub API（境外部署可用；国内会被 SNI 阻断，放到最后）。"""
+    r = await cli.get(f"https://hub.docker.com/v2/repositories/{HUB_REPO}/tags/latest")
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    d = r.json()
+    t = _parse_time(d.get("last_updated") or d.get("tag_last_pushed"))
+    if not t:
+        raise RuntimeError("响应缺少 last_updated")
+    return t, "hub"
 
-    notify=True 时（仅后台循环调用）在发现新版本、且该版本尚未通知过时，
-    按已启用的通道推送一次；前端轮询只读结果，不重复通知。
-    缓存命中（60 秒内已查过）时也处理通知，避免前端轮询刚好刷新缓存
-    导致后台循环错过这一轮。
+
+async def _src_registry(cli, base, source):
+    """按 OCI/Docker Registry v2 取 latest 的镜像构建时间（ghcr / 局域网镜像通用）。"""
+    repo = HUB_REPO
+    token = None
+    try:
+        tr = await cli.get(f"{base}/token?scope=repository:{repo}:pull",
+                           headers={"Accept": "application/json"})
+        if tr.status_code == 200:
+            token = (tr.json() or {}).get("token")
+    except Exception:
+        token = None
+    headers = {"Accept": ", ".join([
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.v2+json"])}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+
+    r = await cli.get(f"{base}/v2/{repo}/manifests/latest", headers=headers)
+    if r.status_code != 200:
+        raise RuntimeError(f"manifest HTTP {r.status_code}")
+    d = r.json()
+    if "manifests" in d:  # 多架构 index：挑本机架构
+        try:
+            machine = (os.uname().machine or "").lower()
+        except Exception:
+            machine = ""
+        want = "arm64" if machine in ("aarch64", "arm64") else "amd64"
+        picks = [m for m in d["manifests"]
+                 if (m.get("platform") or {}).get("architecture") == want]
+        if not picks:
+            picks = [m for m in d["manifests"]
+                     if (m.get("platform") or {}).get("architecture") not in (None, "unknown")]
+        if not picks:
+            raise RuntimeError("index 内无可用架构")
+        r = await cli.get(f"{base}/v2/{repo}/manifests/{picks[0]['digest']}", headers=headers)
+        if r.status_code != 200:
+            raise RuntimeError(f"子 manifest HTTP {r.status_code}")
+        d = r.json()
+    cfg = (d.get("config") or {}).get("digest")
+    if not cfg:
+        raise RuntimeError("manifest 缺少 config digest")
+    b = await cli.get(f"{base}/v2/{repo}/blobs/{cfg}", headers=headers)
+    if b.status_code != 200:
+        raise RuntimeError(f"config blob HTTP {b.status_code}")
+    created = _parse_time((b.json() or {}).get("created"))
+    if not created:
+        raise RuntimeError("config 缺少 created")
+    return created, source
+
+
+async def _check_panel_update(notify: bool = False) -> dict:
+    """对照远端 latest 的镜像构建时间与本地镜像构建时间，判断面板是否有新版。
+
+    多源按优先级依次尝试，任一成功即用；上一轮成功的源下一轮优先，避免每次都
+    白跑一遍被墙的源。全部失败时把每个源的原因记进 errors，前端可展示，
+    不再像旧版那样 except: pass 静默吞掉——那会让「检测失败」伪装成「无更新」。
     """
     state = PANEL_UPDATE_STATE
     state["current"] = APP_VERSION
@@ -627,18 +760,35 @@ async def _check_panel_update(notify: bool = False) -> dict:
         if notify and state["update"]:
             await _notify_panel_update(state["hub_time"])
         return state
-    update, hub_time = False, None
-    try:
-        async with httpx.AsyncClient(timeout=8) as cli:
-            r = await cli.get(f"https://hub.docker.com/v2/repositories/{HUB_REPO}/tags/latest")
-            if r.status_code == 200:
-                d = r.json()
-                hub_time = d.get("last_updated") or d.get("tag_last_pushed")
-                if hub_time:
-                    update = datetime.fromisoformat(hub_time.replace("Z", "+00:00")) > _boot_time()
-    except Exception:
-        pass
-    state.update({"update": update, "hub_time": hub_time, "checked_at": now_ts})
+
+    build_time = _image_build_time()
+    handlers = {
+        "ghcr": lambda cli: _src_registry(cli, "https://ghcr.io", "ghcr"),
+        "mirror": lambda cli: _src_registry(cli, f"https://{PANEL_MIRROR_REGISTRY}", "mirror"),
+        "hub": _src_hub,
+    }
+    order = [s for s in (PANEL_UPDATE_SOURCES or list(handlers)) if s in handlers]
+    last_ok = state.get("source")
+    if last_ok in order:
+        order = [last_ok] + [s for s in order if s != last_ok]
+
+    update, hub_time, used, errors = False, None, None, {}
+    async with httpx.AsyncClient(timeout=6, follow_redirects=True) as cli:
+        for name in order:
+            try:
+                remote, used = await handlers[name](cli)
+                hub_time = remote.isoformat().replace("+00:00", "Z")
+                update = remote > build_time
+                break
+            except Exception as e:
+                used = None
+                errors[name] = f"{type(e).__name__}: {str(e)[:80]}"
+
+    state.update({
+        "update": update, "hub_time": hub_time, "checked_at": now_ts,
+        "source": used, "errors": errors,
+        "build_time": build_time.isoformat().replace("+00:00", "Z"),
+    })
     if notify and update:
         await _notify_panel_update(hub_time)
     return state
@@ -648,7 +798,9 @@ async def _check_panel_update(notify: bool = False) -> dict:
 async def version_check():
     state = await _check_panel_update()
     return {"current": state["current"], "repo": state["repo"],
-            "update": state["update"], "hub_time": state["hub_time"]}
+            "update": state["update"], "hub_time": state["hub_time"],
+            "source": state.get("source"), "errors": state.get("errors") or {},
+            "build_time": state.get("build_time")}
 
 
 # ---------- 背景图（深浅主题各一套） ----------
