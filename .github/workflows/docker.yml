@@ -31,11 +31,16 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Resolve build time
+        run: echo "BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
       - uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            BUILD_TIME=${{ env.BUILD_TIME }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/dc-panel:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/dc-panel:latest
